@@ -4,6 +4,12 @@
 
 # SPDX-FileCopyrightText: 2021 Stefan Schmidt
 
+# Auto-detect NXDK_DIR if not set (workaround for MSYS2 make env propagation)
+if [ -z "$NXDK_DIR" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    NXDK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
 clang \
     -target i386-pc-win32 \
     -march=pentium3 \

@@ -183,6 +183,18 @@ void XAudioInit(int sampleSizeInBits, int numChannels, XAudioCallback callback, 
 	while(!(pac97device->mmio[0x130>>2]&0x100))
 		;
 
+	// Enable S/PDIF transmitter via PCI config register 0x4C bit 24.
+	// Required for nForce/MCPX direct S/PDIF output (per Linux snd-intel8x0).
+	// Without this, S/PDIF DMA runs but TOSLINK produces no signal.
+	// Xbox PCI: all MCPX functions are on device 0. ACI = function 6.
+	{
+		ULONG spdifReg = 0;
+		ULONG aciSlot = (0 << 3) | 6; // ACI: PCI bus 0, device 0, function 6
+		HalReadWritePCISpace(0, aciSlot, 0x4C, &spdifReg, sizeof(spdifReg), FALSE);
+		spdifReg |= 0x01000000; // bit 24: enable S/PDIF output
+		HalReadWritePCISpace(0, aciSlot, 0x4C, &spdifReg, sizeof(spdifReg), TRUE);
+	}
+
 	// reset bus master registers for analog output
 	pb[0x11B] = (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1);
 	while(pb[0x11B] & (1 << 1))
