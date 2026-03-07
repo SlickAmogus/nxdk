@@ -1,4 +1,5 @@
 HAL_SRCS := \
+	$(NXDK_DIR)/lib/hal/apu.c \
 	$(NXDK_DIR)/lib/hal/audio.c \
 	$(NXDK_DIR)/lib/hal/debug.c \
 	$(NXDK_DIR)/lib/hal/fileio.c \
