@@ -218,6 +218,9 @@ static uint8_t   voice_playing[MAX_VOICES];
 // Track whether a voice is already linked in the TVL2D list
 static uint8_t   voice_in_tvl[MAX_VOICES];
 
+// Track last voice added to TVL2D chain (for forward-linking)
+static int       tvl2d_last_voice = -1;
+
 // Diagnostic counters
 static int diag_play_calls = 0;
 static int diag_play_ok = 0;
@@ -483,38 +486,79 @@ static const struct { uint16_t addr; uint32_t val; } ds_gp_xmem[] = {
 };
 
 // ---------------------------------------------------------------------------
-// Custom GP program — copies MIXBUF bins 0+1 to CPU-readable XMEM each frame
+// Custom GP program — probes MIXBUF bins on each START_FRAME
 // ---------------------------------------------------------------------------
-// 20 words. Replaces the DirectSound GP program.
-// Uses R7=0 (reset default) as base for XMEM reads with offset addressing.
-// XMEM[0] = MIXBUF source base (0x001400 in DSP address space)
-// XMEM[1] = XMEM destination base (0x000080)
-// XMEM[4] = frame counter (incremented each frame, for CPU diagnostics)
+// BUILD 7: MIXBUF PROBE
+// On each START_FRAME, reads first samples of MIXBUF bins 0-3 (X:$1400+)
+// and copies to XMEM[4..7] for CPU readback.
+// XMEM[8] = heartbeat (copies XMEM[9] which CPU pre-sets to 0xB6B6).
+// If XMEM[4..7] show non-zero while voices play → VP→MIXBUF→GP data works.
 //
-// The frame protocol matches DirectSound's: poll INTERRUPT_START_FRAME (bit 1
-// of peripheral $05), acknowledge with MOVEP, do work, signal idle via BSET.
-// This keeps the SE frame pipeline running and voice lists walking.
+// Frame protocol (confirmed working in BUILD 6):
+// 1. MOVEP #0xFFF, X:<<$05 — clear stale interrupt flags
+// 2. MOVEP #1, X:<<$04 — signal idle
+// 3. JCLR #1, X:<<$05 — wait for START_FRAME
+// 4. MOVEP #2, X:<<$05 — acknowledge START_FRAME
+// 5. Read MIXBUF bins, copy to diagnostic XMEM slots
 static const uint32_t gp_mixbuf_copy[] = {
-    /* $000 */ 0x0A8581,  // JCLR  #1, X:<<$05, $0000  ; poll frame start (bit 1)
-    /* $001 */ 0x000000,  //   jump target = $0000
-    /* $002 */ 0x08F485,  // MOVEP #imm, X:<<$05        ; acknowledge frame (write bit 1)
-    /* $003 */ 0x000002,  //   immediate = 0x000002
-    /* $004 */ 0x0A77D0,  // MOVE  X:(R7+off),R0        ; R0 = MIXBUF base from XMEM[0]
-    /* $005 */ 0x000000,  //   offset = 0
-    /* $006 */ 0x0A77D4,  // MOVE  X:(R7+off),R4        ; R4 = dest base from XMEM[1]
-    /* $007 */ 0x000001,  //   offset = 1
-    /* $008 */ 0x064080,  // DO    #64, $000B            ; copy 64 words (bins 0+1)
-    /* $009 */ 0x00000B,  //   loop end address
-    /* $00A */ 0x56D800,  // MOVE  X:(R0)+,A             ; read from MIXBUF
-    /* $00B */ 0x565C00,  // MOVE  A,X:(R4)+             ; write to XMEM dest
-    /* $00C */ 0x0A77CE,  // MOVE  X:(R7+off),A          ; read frame counter
-    /* $00D */ 0x000004,  //   offset = 4 -> XMEM[4]
-    /* $00E */ 0x000008,  // INC   A                     ; increment
-    /* $00F */ 0x0A778E,  // MOVE  A,X:(R7+off)          ; write frame counter back
-    /* $010 */ 0x000004,  //   offset = 4 -> XMEM[4]
-    /* $011 */ 0x0A8420,  // BSET  #0, X:<<$04           ; signal idle
-    /* $012 */ 0x0AF080,  // JMP   $0000                 ; loop back
-    /* $013 */ 0x000000,  //   jump target
+    // === BUILD 7: MIXBUF PROBE ===
+
+    // INIT: clear interrupt flags
+    /* $000 */ 0x08F485,  // MOVEP #$FFF, X:<<$05           ; clear all flags
+    /* $001 */ 0x000FFF,
+    /* $002 */ 0x000000,  // NOP                              ; tiny settle
+
+    // === MAIN LOOP ===
+    /* $003 */ 0x08F484,  // MOVEP #1, X:<<$04               ; signal idle
+    /* $004 */ 0x000001,
+    /* $005 */ 0x0A8581,  // JCLR  #1, X:<<$05, $003         ; wait START_FRAME
+    /* $006 */ 0x000003,
+    /* $007 */ 0x08F485,  // MOVEP #2, X:<<$05               ; ack START_FRAME
+    /* $008 */ 0x000002,
+
+    // Read MIXBUF bin 0, sample 0 (X:$1400) → XMEM[4]
+    /* $009 */ 0x60F400,  // MOVE  #$1400, R0
+    /* $00A */ 0x001400,
+    /* $00B */ 0x56E000,  // MOVE  X:(R0), A
+    /* $00C */ 0x60F400,  // MOVE  #4, R0
+    /* $00D */ 0x000004,
+    /* $00E */ 0x566000,  // MOVE  A, X:(R0)                 ; XMEM[4] = bin0[0]
+
+    // Read MIXBUF bin 0, sample 1 (X:$1401) → XMEM[5]
+    /* $00F */ 0x60F400,  // MOVE  #$1401, R0
+    /* $010 */ 0x001401,
+    /* $011 */ 0x56E000,  // MOVE  X:(R0), A
+    /* $012 */ 0x60F400,  // MOVE  #5, R0
+    /* $013 */ 0x000005,
+    /* $014 */ 0x566000,  // MOVE  A, X:(R0)                 ; XMEM[5] = bin0[1]
+
+    // Read MIXBUF bin 1, sample 0 (X:$1420) → XMEM[6]
+    /* $015 */ 0x60F400,  // MOVE  #$1420, R0
+    /* $016 */ 0x001420,
+    /* $017 */ 0x56E000,  // MOVE  X:(R0), A
+    /* $018 */ 0x60F400,  // MOVE  #6, R0
+    /* $019 */ 0x000006,
+    /* $01A */ 0x566000,  // MOVE  A, X:(R0)                 ; XMEM[6] = bin1[0]
+
+    // Read MIXBUF bin 0, sample 16 (X:$1410) → XMEM[7]
+    /* $01B */ 0x60F400,  // MOVE  #$1410, R0
+    /* $01C */ 0x001410,
+    /* $01D */ 0x56E000,  // MOVE  X:(R0), A
+    /* $01E */ 0x60F400,  // MOVE  #7, R0
+    /* $01F */ 0x000007,
+    /* $020 */ 0x566000,  // MOVE  A, X:(R0)                 ; XMEM[7] = bin0[16]
+
+    // Heartbeat: copy XMEM[9] (CPU wrote 0xB6B6) → XMEM[8]
+    /* $021 */ 0x60F400,  // MOVE  #9, R0
+    /* $022 */ 0x000009,
+    /* $023 */ 0x56E000,  // MOVE  X:(R0), A
+    /* $024 */ 0x60F400,  // MOVE  #8, R0
+    /* $025 */ 0x000008,
+    /* $026 */ 0x566000,  // MOVE  A, X:(R0)                 ; XMEM[8] = 0xB6B6
+
+    // Loop back
+    /* $027 */ 0x0AF080,  // JMP   $003
+    /* $028 */ 0x000003,
 };
 
 // XMEM destination for copied MIXBUF data (word offset in GP XMEM)
@@ -543,7 +587,8 @@ static int gp_init(void)
     //      - Page 11: Linear scratch write (640 samples at offset 0xB000)
     //    We need at least 12 pages (48KB). Allocate 16 (64KB) for safety.
 #define GP_SCRATCH_PAGES 16
-    gp_scratch_pages_virt = alloc_contiguous(PAGE_SIZE * GP_SCRATCH_PAGES, &gp_scratch_pages_phys);
+#define GP_PAGE_BYTES    (4096 * 4)  // 4096 DSP words × 4 bytes/word = 16KB per SGE page
+    gp_scratch_pages_virt = alloc_contiguous(GP_PAGE_BYTES * GP_SCRATCH_PAGES, &gp_scratch_pages_phys);
     if (!gp_scratch_pages_virt) {
         xbox_log("APU: GP scratch pages alloc FAILED\n");
         return -1;
@@ -566,7 +611,7 @@ static int gp_init(void)
 
     xbox_log("APU: GP alloc scratch_pages=%08X (%dKB/%dpages) sge=%08X fifo=%08X\n",
              (unsigned)gp_scratch_pages_phys,
-             (GP_SCRATCH_PAGES * PAGE_SIZE) / 1024, GP_SCRATCH_PAGES,
+             (GP_SCRATCH_PAGES * GP_PAGE_BYTES) / 1024, GP_SCRATCH_PAGES,
              (unsigned)gp_scratch_phys, (unsigned)gp_fifo_phys);
 
     // 5. Set up scratch SGE table: one entry per page.
@@ -575,12 +620,25 @@ static int gp_init(void)
     volatile uint32_t *sge = (volatile uint32_t *)gp_scratch_virt;
     memset((void *)gp_scratch_virt, 0, PAGE_SIZE);
     for (int i = 0; i < GP_SCRATCH_PAGES; i++) {
-        sge[i * 2 + 0] = gp_scratch_pages_phys + (i * PAGE_SIZE);  // page address
+        sge[i * 2 + 0] = gp_scratch_pages_phys + (i * GP_PAGE_BYTES);  // 16KB per page
         sge[i * 2 + 1] = (i == GP_SCRATCH_PAGES - 1) ? (1u << 14) : 0;  // EOL on last
     }
 
-    // 6. Zero FIFO SGE table
-    memset((void *)gp_fifo_virt, 0, PAGE_SIZE);
+    // 6. Set up FIFO SGE table — MUST match scratch pages!
+    //    The DS GP program issues FIFO DMA commands that read MIXBUF data from
+    //    addresses like $1400 (bin 0) through the FIFO. The FIFO hardware resolves
+    //    these addresses through the FIFO SGE (GPFADDR). If the FIFO SGE doesn't
+    //    map to our scratch pages, the DMA reads from the wrong physical memory.
+    //    BUILD 8 proved: keeping kernel's GPFADDR → MIXBUF DMA returns all zeros.
+    //    BUILD 10: populate our FIFO SGE with same pages as scratch SGE.
+    {
+        volatile uint32_t *fifo_sge = (volatile uint32_t *)gp_fifo_virt;
+        memset((void *)gp_fifo_virt, 0, PAGE_SIZE);
+        for (int i = 0; i < GP_SCRATCH_PAGES; i++) {
+            fifo_sge[i * 2 + 0] = gp_scratch_pages_phys + (i * GP_PAGE_BYTES);
+            fifo_sge[i * 2 + 1] = (i == GP_SCRATCH_PAGES - 1) ? (1u << 14) : 0;
+        }
+    }
 
     // 7. Write DS GP program + trampoline to scratch pages.
     // GPRST=3 triggers DMA from CURRENT GPSADDR (ours), which overwrites any
@@ -588,55 +646,57 @@ static int gp_init(void)
     // PMEM MMIO writes (below) handle the brief window before DMA completes.
     // The DSP halts on BSET idle (~5ms until SE wakes it), giving DMA plenty
     // of time to finish loading the full program from scratch pages.
-    // Zero all scratch pages (64KB) so DMA ringbuffers start clean
-    memset((void *)gp_scratch_pages_virt, 0, PAGE_SIZE * GP_SCRATCH_PAGES);
+    // Zero all scratch pages (256KB) so DMA ringbuffers start clean
+    memset((void *)gp_scratch_pages_virt, 0, GP_PAGE_BYTES * GP_SCRATCH_PAGES);
     volatile uint32_t *p0 = (volatile uint32_t *)gp_scratch_pages_virt;
 
-    // Copy DS GP program (376 words) to scratch page 0.
-    // Keep ORIGINAL entry: $000=JSR $155 (call init). Init clears interrupt flags,
-    // sets up R0/X0, then RTS back to $002 (main loop). BUT NOP out the XMEM/YMEM
-    // zeroing at $15B/$15D so our pre-loaded config survives.
-    // Previous attempts that skipped init entirely (BSET at $000) failed — the main
-    // loop hung, possibly because stale interrupt flags weren't cleared.
-    // Full PMEM is also written via MMIO to eliminate DMA race conditions.
+    // BUILD 8: Write FULL DS GP program to scratch PMEM region (offset 0x0000)
     for (int i = 0; i < (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])); i++) {
         p0[i] = ds_gp_pmem[i];
     }
+    // NOP out XMEM/YMEM zeroing calls in init ($15B/$15D) — we pre-load config
+    p0[0x15B] = 0x000000;  // NOP (was JSR $165 = zero XMEM)
+    p0[0x15C] = 0x000000;  // NOP (was target $165)
+    p0[0x15D] = 0x000000;  // NOP (was JSR $169 = zero YMEM)
+    p0[0x15E] = 0x000000;  // NOP (was target $169)
 
-    // NOP out XMEM/YMEM zeroing in init (preserve our pre-loaded config)
-    p0[0x15B] = DSP_OP_NOP;      // was JSR $165 (zero XMEM)
-    p0[0x15C] = DSP_OP_NOP;      // was target $165
-    p0[0x15D] = DSP_OP_NOP;      // was JSR $169 (zero YMEM)
-    p0[0x15E] = DSP_OP_NOP;      // was target $169
+    // BUILD 11: MIXBUF probe trampoline at $170 (unused space in DS GP program).
+    // After each START_FRAME, reads MIXBUF bin 1 ($1420) and stores to XMEM[$0005].
+    // This verifies VP→MIXBUF data flow (CPU can read XMEM[$0005] via MMIO).
+    p0[0x170] = 0x44F000;  // MOVE X:abs, X0 (read from absolute address)
+    p0[0x171] = 0x001420;  // source = X:$1420 (MIXBUF bin 1, sample 0)
+    p0[0x172] = 0x447000;  // MOVE X0, X:abs (write to absolute address)
+    p0[0x173] = 0x000005;  // dest = X:$0005 (XMEM diagnostic slot)
+    p0[0x174] = ds_gp_pmem[0x02D];  // relocated original instruction at $02D
+    p0[0x175] = ds_gp_pmem[0x02E];  // relocated original extension at $02E
+    p0[0x176] = 0x00000C;  // RTS
+    // Redirect $02D→$02E to call our trampoline instead
+    p0[0x02D] = 0x0BF080;  // JSR abs
+    p0[0x02E] = 0x000170;  // target = $170
 
-    xbox_log("APU: GP scratch pages = DS program, original entry JSR $155, NOPed zeroing\n");
-
-    // Page 1+ already zeroed by memset above
+    xbox_log("APU: GP scratch = BUILD11 (%d words DS GP, 16KB pages, MIXBUF probe)\n",
+             (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])));
 
     // 8. Flush CPU cache so DMA sees all our writes
     __asm__ volatile("sfence" ::: "memory");  // Flush write-combine buffers first
     __asm__ volatile("wbinvd" ::: "memory");  // Then flush all caches
 
-    // 9. Write GPSADDR to OUR scratch SGE. KEEP kernel's GPFADDR!
-    //    The DS program writes to GP FIFO peripheral registers (X:$FFD6/$FFD7).
-    //    If our zeroed FIFO SGE has no valid pages, the FIFO DMA stalls the DSP,
-    //    causing the main loop to hang before reaching the idle signal at $029.
-    //    The kernel's GPFADDR may have valid FIFO SGE entries from boot init.
+    // 9. Write GPSADDR and GPFADDR to OUR SGE tables.
+    //    BUILD 10: Both scratch and FIFO SGE now map to the same physical pages.
+    //    Previously (BUILD 8) we kept kernel's GPFADDR which mapped to the kernel's
+    //    old scratch pages. FIFO DMA resolved $1400 to wrong physical memory → zeros.
     uint32_t old_gps = APU(NV_PAPU_GPSADDR);
     uint32_t old_gpf = APU(NV_PAPU_GPFADDR);
     uint32_t old_gpfmax = APU(NV_PAPU_GPFMAXSGE);
     APU(NV_PAPU_GPSADDR) = gp_scratch_phys;
-    // DON'T write GPFADDR — keep kernel's FIFO SGE table!
-    // APU(NV_PAPU_GPFADDR) = gp_fifo_phys;  // REMOVED — was zeroing FIFO!
-    // Set GPSMAXSGE to match our scratch table (16 pages, max index = 15)
-    APU(NV_PAPU_GPSMAXSGE) = GP_SCRATCH_PAGES - 1;
-    xbox_log("APU: GP GPSADDR %08X->%08X GPFADDR %08X(KEPT) GPFMAX=%X MAXSGE=%X\n",
+    APU(NV_PAPU_GPFADDR) = gp_fifo_phys;      // BUILD 10: use OUR FIFO SGE!
+    APU(NV_PAPU_GPSMAXSGE) = GP_SCRATCH_PAGES - 1;   // 15 (16 scratch pages)
+    APU(NV_PAPU_GPFMAXSGE) = GP_SCRATCH_PAGES - 1;   // 15 (16 FIFO pages)
+    xbox_log("APU: GP GPSADDR %08X->%08X GPFADDR %08X->%08X GPFMAX=%X->%X MAXSGE=%X BUILD11\n",
              (unsigned)old_gps, (unsigned)APU(NV_PAPU_GPSADDR),
-             (unsigned)old_gpf, (unsigned)old_gpfmax,
+             (unsigned)old_gpf, (unsigned)APU(NV_PAPU_GPFADDR),
+             (unsigned)old_gpfmax, (unsigned)APU(NV_PAPU_GPFMAXSGE),
              (unsigned)APU(NV_PAPU_GPSMAXSGE));
-
-    // NOTE: Don't read kernel's FIFO SGE memory directly — physical address
-    // 0x03494000 may not be mapped/accessible, caused a hang on real hardware.
 
     // 10. TWO-PHASE GPRST release:
     //     Phase A: GPRST=1 (release subsystem, trigger DMA bootstrap, DSP stays reset)
@@ -657,40 +717,44 @@ static int gp_init(void)
     // are valid before GPRST=3. DMA then overwrites with identical content.
     volatile uint32_t *pmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPPMEM);
 
-    // Write FULL DS GP program (376 words) to PMEM via MMIO
+    // BUILD 8: Write FULL DS GP program to PMEM via MMIO (fixes DMA race)
     for (int i = 0; i < (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])); i++) {
         pmem[i] = ds_gp_pmem[i];
     }
-    // Apply same patches as scratch pages: keep original $000/$001, NOP init zeroing
-    pmem[0x15B] = DSP_OP_NOP;          // NOP out JSR $165 (XMEM zeroing)
-    pmem[0x15C] = DSP_OP_NOP;
-    pmem[0x15D] = DSP_OP_NOP;          // NOP out JSR $169 (YMEM zeroing)
-    pmem[0x15E] = DSP_OP_NOP;
+    // NOP out XMEM/YMEM zeroing in PMEM MMIO too (must match scratch)
+    pmem[0x15B] = 0x000000;
+    pmem[0x15C] = 0x000000;
+    pmem[0x15D] = 0x000000;
+    pmem[0x15E] = 0x000000;
+    // BUILD 11: MIXBUF probe in PMEM MMIO too (must match scratch patches)
+    pmem[0x170] = 0x44F000;  pmem[0x171] = 0x001420;
+    pmem[0x172] = 0x447000;  pmem[0x173] = 0x000005;
+    pmem[0x174] = ds_gp_pmem[0x02D];  pmem[0x175] = ds_gp_pmem[0x02E];
+    pmem[0x176] = 0x00000C;
+    pmem[0x02D] = 0x0BF080;  pmem[0x02E] = 0x000170;
 
-    // Verify PMEM MMIO readback (spot check)
+    // Verify PMEM MMIO readback
     {
-        uint32_t r0 = pmem[0] & 0xFFFFFF, r1 = pmem[1] & 0xFFFFFF;
-        uint32_t rdb = pmem[0xDB] & 0xFFFFFF, r29 = pmem[0x29] & 0xFFFFFF;
-        uint32_t r15b = pmem[0x15B] & 0xFFFFFF;
-        xbox_log("APU: GP PMEM@1 FULL: $000=%06X(JSR) $001=%06X($155) $0DB=%06X $029=%06X(idle) $15B=%06X(NOP)\n",
-                 (unsigned)r0, (unsigned)r1, (unsigned)rdb, (unsigned)r29, (unsigned)r15b);
+        uint32_t r0 = pmem[0] & 0xFFFFFF;
+        uint32_t r1 = pmem[1] & 0xFFFFFF;
+        uint32_t r2d = pmem[0x2D] & 0xFFFFFF;  // Should be JSR $170 (probe)
+        uint32_t r170 = pmem[0x170] & 0xFFFFFF; // Should be MOVE X:abs opcode
+        uint32_t r15b = pmem[0x15B] & 0xFFFFFF; // Should be NOP (patched)
+        xbox_log("APU: GP PMEM@1 B11: $000=%06X $001=%06X $02D=%06X(JSR170?) $170=%06X(probe) $15B=%06X(NOP)\n",
+                 (unsigned)r0, (unsigned)r1, (unsigned)r2d, (unsigned)r170, (unsigned)r15b);
     }
 
-    // Zero ALL XMEM and YMEM via MMIO, then write our config entries on top.
-    // GPRST=1 DMA loaded kernel's old GP program, leaving stale data in XMEM/YMEM.
-    // DS subroutines read from XMEM addresses NOT in our config array — stale
-    // values cause hangs. Must be all-zero + our config (like DirectSound does).
-    // XMEM/YMEM survive GPRST 1→3 (confirmed on hardware).
+    // BUILD 11: Zero XMEM then write config on top (DEAD markers no longer needed)
     volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
     volatile uint32_t *gp_ymem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPYMEM);
     for (int i = 0; i < 4096; i++) gp_xmem[i] = 0;  // Zero all XMEM
     for (int i = 0; i < 2048; i++) gp_ymem[i] = 0;  // Zero all YMEM
 
-    // Write our 60 config entries on top of zeroed XMEM
+    // Load DS GP XMEM configuration on top of markers
     for (int i = 0; i < (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])); i++) {
         gp_xmem[ds_gp_xmem[i].addr] = ds_gp_xmem[i].val;
     }
-    xbox_log("APU: GP zeroed XMEM(4096)+YMEM(2048), wrote %d config entries + DS program\n",
+    xbox_log("APU: GP XMEM config loaded (%d entries, BUILD 11: 16KB pages + probe)\n",
              (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])));
 
     // Phase B deferred: GPRST=3 happens AFTER SE starts (SECTL=0x0F).
@@ -708,59 +772,33 @@ static void gp_release_dsp(void)
     xbox_log("APU: GP phase B: setting GPRST=3 (release DSP, SE already running)\n");
     GP(NV_PAPU_GPRST) = GPRST_GPRST | GPRST_GPDSPRST;  // = 3
 
-    // Check PMEM immediately — does our DS program survive GPRST=3?
-    {
-        volatile uint32_t *pmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPPMEM);
-        xbox_log("APU: GP PMEM@3 IMMEDIATE $000=%06X(exp JSR) $001=%06X(exp $155) $002=%06X\n",
-                 (unsigned)(pmem[0] & 0xFFFFFF), (unsigned)(pmem[1] & 0xFFFFFF),
-                 (unsigned)(pmem[2] & 0xFFFFFF));
-        for (volatile int d = 0; d < 1000000; d++) {}
-        xbox_log("APU: GP PMEM@3 +1M $000=%06X $002=%06X $029=%06X $15B=%06X(NOP?)\n",
-                 (unsigned)(pmem[0] & 0xFFFFFF), (unsigned)(pmem[2] & 0xFFFFFF),
-                 (unsigned)(pmem[0x029] & 0xFFFFFF), (unsigned)(pmem[0x15B] & 0xFFFFFF));
-    }
+    // BUILD 10: DS GP program with OUR FIFO SGE — wait for DMA + frames.
+    for (volatile int d = 0; d < 60000000; d++) {}  // ~80ms at 733MHz
 
-    // Check XMEM — did hardware zero it at GPRST 1→3?
-    {
-        volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        uint32_t x6 = gp_xmem[6] & 0xFFFFFF;
-        uint32_t x28 = gp_xmem[0x28] & 0xFFFFFF;
-        xbox_log("APU: GP XMEM after GPRST=3: [6]=%06X(exp 004006) [28]=%06X(exp 001400)\n",
-                 (unsigned)x6, (unsigned)x28);
-        if (x6 == 0 || x28 == 0) {
-            xbox_log("APU: XMEM was zeroed by hardware! Re-writing config...\n");
-            for (int i = 0; i < (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])); i++) {
-                gp_xmem[ds_gp_xmem[i].addr] = ds_gp_xmem[i].val;
-            }
-            xbox_log("APU: XMEM re-written (%d entries)\n",
-                     (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])));
-        }
-    }
-
-    // Wait for DSP to execute BSET idle and SE to detect idle edge
-    for (volatile int d = 0; d < 5000000; d++) {}
-
-    // Check SECONFIG — bit 5 should now be set if GP signaled idle
     {
         uint32_t secfg = APU(NV_PAPU_SECONFIG);
-        xbox_log("APU: post-release SECONFIG=%08X (bit5=%s)\n",
-                 (unsigned)secfg, (secfg & 0x20) ? "SET" : "not set");
-    }
-
-    // Verify XMEM config is still present (DSP init may have zeroed it if NOPs failed)
-    {
         volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        uint32_t x6 = gp_xmem[6] & 0xFFFFFF;
-        uint32_t x28 = gp_xmem[0x28] & 0xFFFFFF;
-        uint32_t x7c = gp_xmem[0x7C] & 0xFFFFFF;
-        xbox_log("APU: GP XMEM final: [6]=%06X [28]=%06X [7C]=%06X\n",
-                 (unsigned)x6, (unsigned)x28, (unsigned)x7c);
-        if (x6 == 0 || x28 == 0) {
-            xbox_log("APU: XMEM zeroed by DSP init (NOPs didn't work)! Re-writing...\n");
-            for (int i = 0; i < (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])); i++) {
-                gp_xmem[ds_gp_xmem[i].addr] = ds_gp_xmem[i].val;
-            }
+        xbox_log("APU: post-release SECONFIG=%08X (bit5=%s bit7=%s) BUILD11\n",
+                 (unsigned)secfg,
+                 (secfg & 0x20) ? "GP_IDLE" : "gp_busy",
+                 (secfg & 0x80) ? "EP_IDLE" : "ep_busy");
+
+        // BUILD 11: MIXBUF probe check — XMEM[$0005] holds MIXBUF bin 1 sample 0
+        uint32_t mixprobe = gp_xmem[0x0005] & 0xFFFFFF;
+        xbox_log("APU: MIXBUF probe: XMEM[$5]=%06X (%s)\n",
+                 (unsigned)mixprobe, mixprobe ? "VP→MIXBUF OK!" : "zero/no data");
+
+        // Check scratch output ringbuffers (16KB per page: $8000 = page 8)
+        volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
+        int nz_fl = 0;
+        for (int i = 0; i < 32; i++) {
+            if (scratch[0x8000 + i] & 0xFFFFFF) nz_fl++;
         }
+        xbox_log("APU: scratch FL($8000) nz=%d/32 [0]=%06X [1]=%06X XMEM[29]=%06X\n",
+                 nz_fl,
+                 (unsigned)(scratch[0x8000] & 0xFFFFFF),
+                 (unsigned)(scratch[0x8001] & 0xFFFFFF),
+                 (unsigned)(gp_xmem[0x29] & 0xFFFFFF));
     }
 }
 
@@ -961,26 +999,35 @@ int XApuInit(void)
     xbox_log("APU: kern VPVA=%08X (ours=%08X)\n",
              (unsigned)kern_vpva, (unsigned)voice_array_phys);
 
+    // Dump full kernel SE register state BEFORE any changes
+    {
+        xbox_log("APU: KERN_SE_DUMP:");
+        for (uint32_t off = 0x2000; off <= 0x20E0; off += 4) {
+            uint32_t val = APU(off);
+            if (val != 0) xbox_log(" %04X=%08X", (unsigned)off, (unsigned)val);
+        }
+        xbox_log("\n");
+    }
+
     // -----------------------------------------------------------------------
-    // STEP 1: Stop SE, reset GP only. KEEP kernel EP intact (EPRST=1).
-    // DirectSound does EPRST 1→3 (keeps kernel's EP program loaded).
-    // Our previous approach (EPRST=0→3 with tiny idle program) may have
-    // broken the SE frame pipeline.
+    // STEP 1: DON'T stop SE! DirectSound never sets SECTL=0.
+    // Stopping the SE may reset internal GP frame dispatch state.
+    // Just disable interrupts, reset GP, keep everything else running.
     // -----------------------------------------------------------------------
     uint32_t kern_seconfig = APU(NV_PAPU_SECONFIG);
     xbox_log("APU: kern SECONFIG=%08X before any changes\n", (unsigned)kern_seconfig);
     APU(NV_PAPU_IEN) = 0;                // Disable APU interrupts
     APU(NV_PAPU_ISTS) = 0xFFFFFFFF;      // Clear all pending
-    APU(NV_PAPU_SECTL) = 0;              // Stop frame engine
-    GP(NV_PAPU_GPRST) = 0;              // Full GP reset
+    // APU(NV_PAPU_SECTL) = 0;           // REMOVED — don't stop SE!
+    GP(NV_PAPU_GPRST) = 0;              // Full GP reset (while SE runs)
     // DO NOT reset EP! Keep kernel's EPRST=1 and EP program/scratch intact.
-    // EP(NV_PAPU_EPRST) = 0;           // REMOVED — was killing kernel EP!
     for (volatile int d = 0; d < 10000; d++) {}
+    xbox_log("APU: SECTL=%08X (kept running, not stopped)\n", (unsigned)APU(NV_PAPU_SECTL));
 
     // -----------------------------------------------------------------------
-    // STEP 2: Write VP structure addresses (while SECTL=0, GP/EP in reset)
+    // STEP 2: Write VP structure addresses (while SE is still running!)
     // -----------------------------------------------------------------------
-    // DirectSound writes these during init — they ARE writable when SE is stopped.
+    // DirectSound writes these while SE runs (SECTL never goes to 0).
     APU(NV_PAPU_VPVADDR)   = voice_array_phys;
     APU(NV_PAPU_VPSGEADDR) = sge_table_phys;
     APU(NV_PAPU_VPSSLADDR) = ssl_table_phys;
@@ -1027,9 +1074,6 @@ int XApuInit(void)
     APU(NV_PAPU_FENADDR) = notifier_phys;
     APU(NV_PAPU_FETFORCE0) = 0;          // No forced traps
     APU(NV_PAPU_FETFORCE1) = 0;          // Don't trap on idle voices!
-    // NOTE: Setting FETFORCE1 bit 15 (SE2FE_IDLE_VOICE) causes the FE to
-    // trap itself when ANY voice goes idle. Without an ISR to untrap it,
-    // PIO processing stalls permanently. Set to 0 for free-running operation.
     APU(NV_PAPU_ISTS) = 0xFFFFFFFF;
     APU(NV_PAPU_TVL2D)  = 0xFFFF;
     APU(NV_PAPU_TVL3D)  = 0xFFFF;
@@ -1049,23 +1093,32 @@ int XApuInit(void)
                  (secfg_after & 0x20) ? "STUCK" : "REJECTED");
     }
 
-    // Initialize submix registers (0x208C-0x20A8) — voice-to-mixbin routing.
-    // DirectSound sets all bytes to 0x01 (1 voice per submix group for 31 groups).
-    // Without this, the SE may not route voice output to MIXBUF bins.
-    for (int i = 0; i < 7; i++) {
-        APU(NV_PAPU_SUBMIX0 + i * 4) = 0x01010101;
+    // Initialize submix registers (0x208C-0x20A8) — submix bin → GP bin routing.
+    // 1:1 mapping for bins 0-5 gives proper 5.1 channel separation:
+    //   submix 0→GP0(FL), 1→GP1(FR), 2→GP2(C), 3→GP3(LFE), 4→GP4(RL), 5→GP5(RR)
+    APU(NV_PAPU_SUBMIX0 + 0 * 4) = 0x03020100;  // submix 0-3 → GP bins 0-3
+    APU(NV_PAPU_SUBMIX0 + 1 * 4) = 0x00000504;  // submix 4-5 → GP bins 4-5, rest→0
+    for (int i = 2; i < 8; i++) {
+        APU(NV_PAPU_SUBMIX0 + i * 4) = 0x00000000;  // submix 8-31 → GP bin 0
     }
-    APU(NV_PAPU_SUBMIX0 + 7 * 4) = 0x00010101;  // Last reg: only 3 groups
     xbox_log("APU: submix registers initialized (208C-20A8)\n");
 
-    // Preserve kernel FECTL config bits, only clear FEMETHMODE to FREE_RUNNING.
-    // DirectSound sets FECTL to 0x0007130F (bits [7:5]=000 = FREE_RUNNING).
-    // Match DirectSound's exact low 16 bits: 0x130F.
+    // BUILD 10: Use DirectSound's FECTL value (0x130F = FEMETHMODE=000 = FREE_RUNNING).
+    // Previously we used 0x130F (FEMETHMODE=100 = HALTED, kernel boot value).
+    // With 0x130F, GP gets START_FRAME but VP may NOT accumulate into MIXBUF.
+    // DirectSound changes from 0x130F → 0x130F. XDK dump confirmed MIXBUF data
+    // only appears with 0x130F. Match DirectSound's value.
     APU(NV_PAPU_FECTL) = (kern_fectl & 0xFFFF0000u) | 0x130F;
-    APU(NV_PAPU_SECTL) = 0x0F;           // All subsystems + XCNTMODE=running
-    xbox_log("APU: FECTL=%08X SECTL=0x0F\n", (unsigned)APU(NV_PAPU_FECTL));
+    // Change SECTL from kernel's 0x07 to 0x0F (add XCNTMODE=1).
+    // DirectSound does exactly this: SECTL 0x07 → 0x0F, never through 0.
+    // This preserves SE internal state while enabling GP-controlled frame timing.
+    xbox_log("APU: SECTL before change: %08X\n", (unsigned)APU(NV_PAPU_SECTL));
+    APU(NV_PAPU_SECTL) = 0x0F;           // All subsystems + XCNTMODE=1
+    xbox_log("APU: FECTL=%08X (FEMETHMODE=%X) SECTL=%08X (0x07->0x0F, no stop)\n",
+             (unsigned)APU(NV_PAPU_FECTL), (unsigned)((APU(NV_PAPU_FECTL) >> 5) & 7),
+             (unsigned)APU(NV_PAPU_SECTL));
 
-    // Try writing SECONFIG=0x2A now that SECTL=0x0F (SE running).
+    // Try writing SECONFIG=0x2A now that SECTL=0x07 (SE running).
     APU(NV_PAPU_SECONFIG) = 0x2A;
     {
         uint32_t secfg_post = APU(NV_PAPU_SECONFIG);
@@ -1092,9 +1145,11 @@ int XApuInit(void)
         uint32_t secfg = APU(NV_PAPU_SECONFIG);
         uint32_t fectl = APU(NV_PAPU_FECTL);
         volatile uint32_t *gp_xmem_chk = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        uint32_t x28 = gp_xmem_chk[0x28] & 0xFFFFFF;
-        xbox_log("APU: post-release: SECONFIG=%08X FECTL=%08X XMEM[28]=%06X (bit5=%s)\n",
-                 (unsigned)secfg, (unsigned)fectl, (unsigned)x28,
+        uint32_t x0 = gp_xmem_chk[0] & 0xFFFFFF;
+        uint32_t x4 = gp_xmem_chk[4] & 0xFFFFFF;
+        xbox_log("APU: post-release: SECONFIG=%08X FECTL=%08X XMEM[0]=%06X [4]=%06X(b0s0) [8]=%06X(hb) (bit5=%s)\n",
+                 (unsigned)secfg, (unsigned)fectl, (unsigned)x0, (unsigned)x4,
+                 (unsigned)(gp_xmem_chk[8] & 0xFFFFFF),
                  (secfg & 0x20) ? "SET" : "not set");
     }
 
@@ -1131,13 +1186,14 @@ int XApuInit(void)
 
     {
         uint32_t fectl_post = APU(NV_PAPU_FECTL);
-        xbox_log("APU: FECTL after settle: %08X\n", (unsigned)fectl_post);
-        if (fectl_post & 0x80) {
-            xbox_log("APU: FE HALTED! Trap reason=%X — re-clearing\n",
-                     (unsigned)((fectl_post >> 8) & 0xF));
-            // Re-assert FREE_RUNNING
+        xbox_log("APU: FECTL after settle: %08X (FEMETHMODE=%X)\n",
+                 (unsigned)fectl_post, (unsigned)((fectl_post >> 5) & 7));
+        // Re-set only if FECTL low bits changed from our target 0x130F
+        if ((fectl_post & 0xFFFF) != 0x130F) {
+            xbox_log("APU: FECTL changed from 138F to %04X — re-setting\n",
+                     (unsigned)(fectl_post & 0xFFFF));
             APU(NV_PAPU_FECTL) = (fectl_post & 0xFFFF0000u) | 0x130F;
-            xbox_log("APU: FECTL re-cleared: %08X\n", (unsigned)APU(NV_PAPU_FECTL));
+            xbox_log("APU: FECTL re-set: %08X\n", (unsigned)APU(NV_PAPU_FECTL));
         }
     }
 
@@ -1175,10 +1231,71 @@ int XApuInit(void)
     // Flush cache so VP sees zeros in physical RAM
     __asm__ volatile("wbinvd" ::: "memory");
 
-    // TVL2D starts empty — voices are added on first play
-    APU(NV_PAPU_TVL2D) = 0xFFFF;
-    memset(voice_in_tvl, 0, sizeof(voice_in_tvl));
-    xbox_log("APU: TVL2D=FFFF (empty, voices added on first play)\n");
+    // -----------------------------------------------------------------------
+    // STEP 4: Pre-link ALL voices as permanent active sentinels
+    // -----------------------------------------------------------------------
+    // The SE stops at ANY inactive voice in the chain. So ALL voices must
+    // remain ACTIVE at all times. When not playing audio, they loop silence.
+    // Chain: 0 → 1 → 2 → ... → MAX_HW_VOICES → FFFF
+    // Voice 0 = pure sentinel (never used for audio)
+    // Voices 1-MAX_HW_VOICES = game voices (redirect to audio when playing)
+    {
+        // SGE entry 0 → ssl_table page (all zeros = silence)
+        uint32_t *sge0 = (uint32_t *)((uint8_t *)sge_table_virt + 0 * SGE_ENTRY_SIZE);
+        sge0[0] = ssl_table_phys & ~0xFFFu;
+        sge0[1] = 0;
+        sge_next_free = 1;  // Reserve SGE entry 0 for silence
+
+        int num_chain = 1 + MAX_HW_VOICES;  // sentinel + game voices
+        uint32_t muted = (0xFFFu << 4) | (0xFFFu << 20);
+
+        for (int i = 0; i < num_chain; i++) {
+            volatile uint32_t *vi = (volatile uint32_t *)
+                ((uint8_t *)voice_array_virt + i * VP_VOICE_SIZE);
+
+            // CFG_VBIN: all bins → 31 (null sink)
+            vi[VOICE_CFG_VBIN / 4] = (31u) | (31u << 5) | (31u << 10)
+                                    | (31u << 15) | (31u << 20) | (31u << 25);
+
+            // CFG_FMT: 8-bit mono, LOOP, headroom=7
+            vi[VOICE_CFG_FMT / 4] = (7u << 13) | (1u << 25)
+                                    | (31u << 0) | (31u << 5);
+
+            // Buffer: SGE entry 0 (silence page), 256 samples
+            vi[VOICE_CUR_PSL_START / 4] = 0;
+            vi[VOICE_PAR_NEXT / 4] = 255;
+
+            // Volumes: fully muted
+            vi[VOICE_TAR_VOLA / 4] = muted;
+            vi[VOICE_TAR_VOLB / 4] = muted;
+            vi[VOICE_TAR_VOLC / 4] = muted;
+            vi[0x18 / 4] = muted;
+            vi[0x1C / 4] = muted;
+            vi[0x28 / 4] = muted;
+
+            // Pitch + link: forward chain (i → i+1, last → FFFF)
+            uint16_t link = (i < num_chain - 1) ? (uint16_t)(i + 1) : 0xFFFF;
+            vi[VOICE_TAR_PITCH_LINK / 4] = (0x1000u << 16) | link;
+
+            // PAR_STATE: ACTIVE + SUSTAIN + EALVL
+            vi[VOICE_PAR_STATE / 4] = VOICE_PAR_ACTIVE
+                                     | (5u << VOICE_PAR_EACUR_SHIFT)
+                                     | (1u << 22);
+
+            voice_in_tvl[i] = 1;
+            voice_allocated[i] = (i == 0) ? 1 : 0;  // Voice 0 reserved
+        }
+
+        // Flush all voice entries to RAM
+        __asm__ volatile("wbinvd" ::: "memory");
+
+        APU(NV_PAPU_TVL2D) = 0;  // SE starts walking from this voice (head)
+        tvl2d_last_voice = num_chain - 1;
+
+        xbox_log("APU: %d voices pre-linked as sentinels (0=anchor, 1-%d=game)\n",
+                 num_chain, MAX_HW_VOICES);
+    }
+    xbox_log("APU: chain 0->1->...->%d->FFFF\n", MAX_HW_VOICES);
 
     // (SECTL/FECTL/etc. already set in STEP 2b above)
 
@@ -1287,9 +1404,9 @@ int XApuVoiceAlloc(void)
     diag_alloc_calls++;
     if (!apu_initialized) return -1;
 
-    // Full 32KB voice array allocated — all 256 voices available
-    // Use voices 0-31 for Duke3D (only needs 8, but 32 gives headroom)
-    for (int i = 0; i < 32; i++) {
+    // Voice 0 is reserved as a permanent sentinel (keeps chain alive).
+    // Use voices 1-31 for Duke3D (only needs 8, but 31 gives headroom)
+    for (int i = 1; i < 32; i++) {
         if (!voice_allocated[i]) {
             voice_allocated[i] = 1;
             voice_playing[i] = 0;
@@ -1393,12 +1510,17 @@ int XApuVoicePlay(int voice, const void *pcm, unsigned int bytes,
     }
 
     // -----------------------------------------------------------------------
-    // Configure VP voice via DIRECT voice array writes (bypasses PIO/FE)
+    // Configure VP voice via DIRECT voice array writes
     // -----------------------------------------------------------------------
-    // The FE microcontroller doesn't process PIO commands on real hardware
-    // (xemu bypasses FE entirely, dispatching PIO directly to fe_method).
-    // Instead, write voice configuration directly to the voice array in RAM,
-    // flush CPU cache (so VP's DMA sees our writes), then link into TVL2D.
+    // PIO doesn't work: the kernel's FE firmware stalls after one command
+    // (FIFO fills up, FEDECMETH stuck at SET_CURRENT_VOICE).
+    //
+    // Previous direct-write approach worked for voice 0 but not 1-7 because
+    // the SE never cleared the NEW flag for voices added after the first.
+    //
+    // NEW STRATEGY: Don't set NEW at all. Pre-initialize the voice fully
+    // (CUR_VOL = TAR_VOL, EACUR=SUSTAIN, EALVL=1) so the VP processes it
+    // directly without needing SE "new voice" initialization.
     // -----------------------------------------------------------------------
 
     // Pointer to this voice's 128-byte entry in the voice array
@@ -1413,79 +1535,73 @@ int XApuVoicePlay(int voice, const void *pcm, unsigned int bytes,
     for (int i = 0; i < VP_VOICE_SIZE / 4; i++) v[i] = 0;
 
     // CFG_FMT (0x04): sample format + routing + headroom
-    // [31:30]=container (0=B8, 1=B16), [29:28]=sample size (0=U8, 1=S16)
-    // [27]=stereo, [25]=loop, [24]=data_type (0=buffer)
-    // [15:13]=HEADROOM (3 bits, 7=max), [9:5]=V7BIN, [4:0]=V6BIN
-    // DirectSound always sets HEADROOM=7. Without it, VP may not mix.
     uint32_t fmt = (7u << 13);  // HEADROOM = 7 (critical for VP mixing)
     if (bits == 16) {
         fmt |= (1u << 28);  // S16 sample
         fmt |= (1u << 30);  // B16 container
     }
     if (channels == 2) fmt |= (1u << 27);
-    if (loop)          fmt |= (1u << 25);
-    // V6BIN/V7BIN: route to unused mixbins (31 = null sink)
-    fmt |= (31u << 0);   // V6BIN → bin 31
-    fmt |= (31u << 5);   // V7BIN → bin 31
+    // ALWAYS set LOOP — VP clears ACTIVE when non-loop sounds end,
+    // which breaks the SE chain. Game calls XApuVoiceStop when done.
+    fmt |= (1u << 25);
+    (void)loop;  // Loop flag handled in software by the game
+    fmt |= (31u << 0);   // V6BIN → bin 31 (null sink)
+    fmt |= (31u << 5);   // V7BIN → bin 31 (null sink)
     v[VOICE_CFG_FMT / 4] = fmt;
 
-    // CFG_VBIN (0x00): vol0→mixbin0 (L), vol1→mixbin1 (R), rest→bin31 (null)
-    // From xemu: V0BIN [4:0], V1BIN [9:5], V2BIN [14:10], V3BIN [20:16], V4BIN [25:21], V5BIN [30:26]
-    // Note: bit 15 is a gap between V2 and V3
-    v[VOICE_CFG_VBIN / 4] = (0u)            // vol0 → bin 0
-                           | (1u << 5)       // vol1 → bin 1
-                           | (31u << 10)     // vol2 → bin 31
-                           | (31u << 16)     // vol3 → bin 31
-                           | (31u << 21)     // vol4 → bin 31
-                           | (31u << 26);    // vol5 → bin 31
+    // CFG_VBIN (0x00): vol0→submix0 (FL), vol1→submix1 (FR), rest→bin31
+    // Each VxBIN field is 5 bits: vol0=[4:0], vol1=[9:5], vol2=[14:10],
+    // vol3=[19:15], vol4=[24:20], vol5=[29:25]
+    v[VOICE_CFG_VBIN / 4] = (0u)            // vol0 → bin 0 (FL)
+                           | (1u << 5)       // vol1 → bin 1 (FR)
+                           | (31u << 10)     // vol2 → bin 31 (null)
+                           | (31u << 15)     // vol3 → bin 31 (null)
+                           | (31u << 20)     // vol4 → bin 31 (null)
+                           | (31u << 25);    // vol5 → bin 31 (null)
 
-    // CUR_PSL_START (0x20): buffer base = sge_base * PAGE_SIZE (byte offset in SGE space)
+    // CUR_PSL_START (0x20): buffer base = sge_base * PAGE_SIZE
     v[VOICE_CUR_PSL_START / 4] = (uint32_t)sge_base * PAGE_SIZE;
 
-    // CUR_PSH_SAMPLE (0x24): loop back offset = 0 (loop to start)
+    // CUR_PSH_SAMPLE (0x24): loop back offset = 0
     v[VOICE_CUR_PSH_SAMPLE / 4] = 0;
 
-    // PAR_OFFSET (0x58): current buffer offset = 0 (start from beginning)
+    // PAR_OFFSET (0x58): CBO = 0 (start from beginning)
     v[VOICE_PAR_OFFSET / 4] = 0;
 
-    // PAR_NEXT (0x5C): end buffer offset = num_samples - 1
+    // PAR_NEXT (0x5C): EBO = num_samples - 1
     v[VOICE_PAR_NEXT / 4] = num_samples - 1;
 
     // TAR_VOLA (0x60): volumes 0,1 as 12-bit attenuation
     uint32_t left_atten  = vol_to_atten(left_vol);
     uint32_t right_atten = vol_to_atten(right_vol);
-    v[VOICE_TAR_VOLA / 4] = pack_vola(left_atten, right_atten);
+    uint32_t vola_packed = pack_vola(left_atten, right_atten);
+    v[VOICE_TAR_VOLA / 4] = vola_packed;
 
     // TAR_VOLB/C (0x64, 0x68): muted (unused bins)
-    v[VOICE_TAR_VOLB / 4] = (0xFFFu << 4) | (0xFFFu << 20);
-    v[VOICE_TAR_VOLC / 4] = (0xFFFu << 4) | (0xFFFu << 20);
+    uint32_t muted_vol = (0xFFFu << 4) | (0xFFFu << 20);
+    v[VOICE_TAR_VOLB / 4] = muted_vol;
+    v[VOICE_TAR_VOLC / 4] = muted_vol;
+
+    // CUR_VOLA/B/C (0x18, 0x1C, 0x28): set current = target (bypass envelope)
+    // Without this, CUR_VOL=0 means the voice is fully muted even if active.
+    v[0x18 / 4] = vola_packed;   // CUR_VOL_A = TAR_VOL_A
+    v[0x1C / 4] = muted_vol;     // CUR_VOL_B = TAR_VOL_B (muted)
+    v[0x28 / 4] = muted_vol;     // CUR_VOL_C = TAR_VOL_C (muted)
 
     // TAR_PITCH_LINK (0x7C): pitch [31:16] + next voice [15:0]
+    // All voices are pre-linked at init. Just update pitch, preserve link.
     uint16_t pitch = rate_to_pitch(rate);
-    if (!voice_in_tvl[voice]) {
-        // First time: prepend to TVL2D
-        uint32_t old_head = APU(NV_PAPU_TVL2D) & 0xFFFF;
-        v[VOICE_TAR_PITCH_LINK / 4] = ((uint32_t)pitch << 16) | (old_head & 0xFFFF);
-    } else {
-        // Already in TVL2D: restore saved link, just update pitch
-        v[VOICE_TAR_PITCH_LINK / 4] = ((uint32_t)pitch << 16) | (uint32_t)saved_link;
-    }
+    v[VOICE_TAR_PITCH_LINK / 4] = ((uint32_t)pitch << 16) | (uint32_t)saved_link;
 
-    // PAR_STATE (0x54): ACTIVE + NEW + ENVA=ATTACK(2) for amplitude ramp-up
-    // Without ENVA=ATTACK, ea_level=0 and voice is completely muted.
-    v[VOICE_PAR_STATE / 4] = VOICE_PAR_ACTIVE | VOICE_PAR_NEW
-                            | (2u << VOICE_PAR_EACUR_SHIFT);
+    // PAR_STATE (0x54): ACTIVE only, NO NEW flag.
+    // Set EACUR=SUSTAIN(5) and EALVL=1 (bit 22) so the VP treats this
+    // voice as already initialized.
+    v[VOICE_PAR_STATE / 4] = VOICE_PAR_ACTIVE
+                            | (5u << VOICE_PAR_EACUR_SHIFT)  // EACUR=SUSTAIN
+                            | (1u << 22);                     // EALVL=1 (amplitude at target)
 
-    // Flush CPU write-back cache so VP's DMA reads see our data in physical RAM.
-    // This covers: PCM data (memcpy above), SGE entries, and voice array writes.
-    // Without this, VP reads stale/zero data from RAM.
+    // Flush CPU write-back cache so VP's DMA reads see our data in RAM
     __asm__ volatile("wbinvd" ::: "memory");
-
-    // Link voice into TVL2D if not already linked
-    if (!voice_in_tvl[voice]) {
-        APU(NV_PAPU_TVL2D) = (uint32_t)voice;
-        voice_in_tvl[voice] = 1;
-    }
 
     voice_playing[voice] = 1;
     diag_play_ok++;
@@ -1501,11 +1617,45 @@ void XApuVoiceStop(int voice)
     if (!apu_initialized) return;
     if (voice < 0 || voice >= MAX_VOICES) return;
 
-    // Clear ACTIVE bit in voice array (direct RAM write, bypasses PIO)
+    // Redirect voice to silence — NEVER clear ACTIVE!
+    // The SE stops at any inactive voice, breaking the chain for all voices
+    // after it. Instead, we redirect to the silence page and mute.
     if (voice < 32 && voice_array_virt) {
         volatile uint32_t *v = (volatile uint32_t *)
             ((uint8_t *)voice_array_virt + voice * VP_VOICE_SIZE);
-        v[VOICE_PAR_STATE / 4] = 0;  // Clear all state (ACTIVE=0)
+
+        // Preserve the chain link
+        uint16_t saved_link = (uint16_t)(v[VOICE_TAR_PITCH_LINK / 4] & 0xFFFF);
+
+        // Redirect buffer to silence page (SGE entry 0)
+        v[VOICE_CUR_PSL_START / 4] = 0;           // SGE base 0 = silence
+        v[VOICE_CUR_PSH_SAMPLE / 4] = 0;
+        v[VOICE_PAR_OFFSET / 4] = 0;              // CBO = 0
+        v[VOICE_PAR_NEXT / 4] = 255;              // EBO = 255 (short loop)
+
+        // Mute all channels
+        uint32_t muted = (0xFFFu << 4) | (0xFFFu << 20);
+        v[VOICE_TAR_VOLA / 4] = muted;
+        v[VOICE_TAR_VOLB / 4] = muted;
+        v[VOICE_TAR_VOLC / 4] = muted;
+        v[0x18 / 4] = muted;  // CUR_VOL_A
+        v[0x1C / 4] = muted;  // CUR_VOL_B
+        v[0x28 / 4] = muted;  // CUR_VOL_C
+
+        // 8-bit mono, LOOP, all bins → null (sentinel mode)
+        v[VOICE_CFG_VBIN / 4] = (31u) | (31u << 5) | (31u << 10)
+                                | (31u << 15) | (31u << 20) | (31u << 25);
+        v[VOICE_CFG_FMT / 4] = (7u << 13) | (1u << 25)
+                               | (31u << 0) | (31u << 5);
+
+        // Restore pitch (low) + link (preserved)
+        v[VOICE_TAR_PITCH_LINK / 4] = (0x1000u << 16) | saved_link;
+
+        // Re-assert ACTIVE (in case VP cleared it when non-loop sound ended)
+        v[VOICE_PAR_STATE / 4] = VOICE_PAR_ACTIVE
+                                | (5u << VOICE_PAR_EACUR_SHIFT)
+                                | (1u << 22);
+
         __asm__ volatile("wbinvd" ::: "memory");
     }
 
@@ -1540,7 +1690,9 @@ void XApuVoiceSetVolume(int voice, int left_vol, int right_vol)
 
     uint32_t left_atten  = vol_to_atten(left_vol);
     uint32_t right_atten = vol_to_atten(right_vol);
-    v[VOICE_TAR_VOLA / 4] = pack_vola(left_atten, right_atten);
+    uint32_t packed = pack_vola(left_atten, right_atten);
+    v[VOICE_TAR_VOLA / 4] = packed;
+    v[0x18 / 4] = packed;  // Also update CUR_VOL_A (no envelope)
     __asm__ volatile("wbinvd" ::: "memory");
 }
 
@@ -1571,31 +1723,9 @@ int XApuVoiceIsPlaying(int voice)
 {
     if (!apu_initialized) return 0;
     if (voice < 0 || voice >= MAX_VOICES) return 0;
-    if (!voice_playing[voice]) return 0;
-
-    // Check the voice's ACTIVE_VOICE bit in PAR_STATE (bit 21)
-    if (voice >= 32 || !voice_array_virt) return voice_playing[voice];
-    volatile uint32_t *v = (volatile uint32_t *)
-        ((uint8_t *)voice_array_virt + voice * VP_VOICE_SIZE);
-    uint32_t state = v[VOICE_PAR_STATE / 4];
-
-    if (!(state & VOICE_PAR_ACTIVE)) {
-        // Voice finished — clean up
-        voice_playing[voice] = 0;
-        int slot = voice_pcm_slot[voice];
-        if (slot >= 0) {
-            pcm_pool_free(slot);
-            voice_pcm_slot[voice] = -1;
-        }
-        if (voice_sge_base[voice] >= 0) {
-            sge_free(voice_sge_base[voice], voice_sge_count[voice]);
-            voice_sge_base[voice] = -1;
-            voice_sge_count[voice] = 0;
-        }
-        return 0;
-    }
-
-    return 1;
+    // ACTIVE is always set (voices loop silence when stopped).
+    // Use software state to track playback.
+    return voice_playing[voice];
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,23 +1758,26 @@ void XApuPumpMixbuf(short *output, int num_samples)
 
     if (!apu_initialized) return;
 
-    // Watchdog: re-clear FECTL if halted, re-assert SECONFIG
+    // Watchdog: re-set FECTL if it changed from our target 0x130F
     {
         uint32_t fectl = APU(NV_PAPU_FECTL);
-        if (fectl & 0xE0) {
+        if ((fectl & 0xFFFF) != 0x130F) {
             APU(NV_PAPU_FECTL) = (fectl & 0xFFFF0000u) | 0x130F;
         }
         APU(NV_PAPU_SECONFIG) = 0x2A;
     }
     if (pump_log_count < 10) {
-        uint32_t fectl = APU(NV_PAPU_FECTL);
-        uint32_t sectl = APU(NV_PAPU_SECTL);
         uint32_t seconfig = APU(NV_PAPU_SECONFIG);
-        uint32_t gprst = GP(NV_PAPU_GPRST);
-        uint32_t eprst = EP(NV_PAPU_EPRST);
-        xbox_log("APU: PUMP#%d FECTL=%08X SECTL=%08X SECFG=%08X GPRST=%X EPRST=%X\n",
-                 pump_log_count, (unsigned)fectl, (unsigned)sectl,
-                 (unsigned)seconfig, (unsigned)gprst, (unsigned)eprst);
+        volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
+        // BUILD 11: MIXBUF probe + scratch ringbuffer check
+        uint32_t mixprobe = gp_xmem[0x0005] & 0xFFFFFF;
+        volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
+        uint32_t fl0 = scratch ? (scratch[0x8000] & 0xFFFFFF) : 0;
+        uint32_t fr0 = scratch ? (scratch[0x9000] & 0xFFFFFF) : 0;
+        xbox_log("APU: PUMP#%d SECFG=%08X(b5=%s) MIX5=%06X FL=%06X FR=%06X\n",
+                 pump_log_count, (unsigned)seconfig,
+                 (seconfig & 0x20) ? "Y" : "N",
+                 (unsigned)mixprobe, (unsigned)fl0, (unsigned)fr0);
         pump_log_count++;
     }
 }
@@ -1688,7 +1821,7 @@ int XApuDiagnostic(char *buf, int bufsize)
     // APU global registers — FECTL is at 0x1100
     uint32_t fectl_cur = APU(NV_PAPU_FECTL);
     if ((fectl_cur & 0xFFFF) != 0x130F) {
-        // Reset FECTL to DirectSound-matching value (FREE_RUNNING mode)
+        // Reset FECTL to kernel-matching value (FEMETHMODE=100)
         APU(NV_PAPU_FECTL) = (fectl_cur & 0xFFFF0000u) | 0x130F;
     }
     DPRINTF("SECTL=%08X FECTL=%08X TVL2D=%08X\n",
@@ -1698,16 +1831,40 @@ int XApuDiagnostic(char *buf, int bufsize)
             (unsigned)APU(NV_PAPU_FECV), (unsigned)APU(NV_PAPU_FEAV),
             (unsigned)APU(NV_PAPU_FETFORCE1), (unsigned)APU(NV_PAPU_ISTS));
 
-    // GP XMEM check — DS GP program uses XMEM for mixbin routing config
+    // BUILD 10: Wide XMEM scan + proper scratch check
     {
-        // Check a few DS XMEM config entries to verify they survived
-        uint32_t x6 = gp_reg[0x0006] & 0xFFFFFF;
-        uint32_t x28 = gp_reg[0x0028] & 0xFFFFFF;
-        uint32_t x7c = gp_reg[0x007C] & 0xFFFFFF;
-        DPRINTF("GP XMEM: [6]=%06X(exp %06X) [28]=%06X(exp %06X) [7C]=%06X(exp %06X)\n",
-                (unsigned)x6, 0x004006,
-                (unsigned)x28, 0x001400,
-                (unsigned)x7c, 0x00000D);
+        volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
+        // Scan XMEM in 256-word regions, report non-zero counts
+        DPRINTF("XM:");
+        for (int r = 0; r < 16; r++) {
+            int base = r * 256;
+            int nz = 0;
+            for (int i = base; i < base + 256 && i < 0x1000; i++) {
+                if (gp_xmem[i] & 0xFFFFFF) nz++;
+            }
+            if (nz > 0) DPRINTF(" $%03X:%d", base, nz);
+        }
+        DPRINTF("\n");
+        // Show a few specific XMEM values for debugging
+        DPRINTF("XMD: [5]=%06X(MIXprobe) [6]=%06X [28]=%06X [29]=%06X [2A]=%06X\n",
+                (unsigned)(gp_xmem[0x05] & 0xFFFFFF),
+                (unsigned)(gp_xmem[0x06] & 0xFFFFFF),
+                (unsigned)(gp_xmem[0x28] & 0xFFFFFF),
+                (unsigned)(gp_xmem[0x29] & 0xFFFFFF),
+                (unsigned)(gp_xmem[0x2A] & 0xFFFFFF));
+        // Check scratch pages for output ringbuffer data (16KB pages: index = DSP addr)
+        volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
+        if (scratch) {
+            int nz_fl = 0, nz_fr = 0;
+            for (int i = 0; i < 32; i++) {
+                if (scratch[0x8000 + i] & 0xFFFFFF) nz_fl++;   // FL ($8000)
+                if (scratch[0x9000 + i] & 0xFFFFFF) nz_fr++;   // FR ($9000)
+            }
+            DPRINTF("SCR: FL=%d/32 FR=%d/32 FL[0]=%06X FR[0]=%06X\n",
+                    nz_fl, nz_fr,
+                    (unsigned)(scratch[0x8000] & 0xFFFFFF),
+                    (unsigned)(scratch[0x9000] & 0xFFFFFF));
+        }
     }
 
     // Voice tracking
@@ -1757,9 +1914,14 @@ int XApuDiagnostic(char *buf, int bufsize)
                 (unsigned)(gp_pmem[2] & 0xFFFFFF), (unsigned)(gp_pmem[3] & 0xFFFFFF),
                 (unsigned)(gp_pmem[4] & 0xFFFFFF), (unsigned)(gp_pmem[5] & 0xFFFFFF),
                 (unsigned)(gp_pmem[6] & 0xFFFFFF), (unsigned)(gp_pmem[7] & 0xFFFFFF));
-        DPRINTF("PMEM $155: %06X %06X %06X %06X (DS init entry)\n",
-                (unsigned)(gp_pmem[0x155] & 0xFFFFFF), (unsigned)(gp_pmem[0x156] & 0xFFFFFF),
-                (unsigned)(gp_pmem[0x157] & 0xFFFFFF), (unsigned)(gp_pmem[0x158] & 0xFFFFFF));
+        // BUILD 11 key addresses: $02D=JSR $170 (probe), $170=MOVE X:abs opcode
+        volatile uint32_t *xmem_diag = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
+        DPRINTF("PMEM B11: $02D=%06X(JSR170?) $02E=%06X $170=%06X(probe) $15B=%06X(NOP) MIX5=%06X\n",
+                (unsigned)(gp_pmem[0x2D] & 0xFFFFFF),
+                (unsigned)(gp_pmem[0x2E] & 0xFFFFFF),
+                (unsigned)(gp_pmem[0x170] & 0xFFFFFF),
+                (unsigned)(gp_pmem[0x15B] & 0xFFFFFF),
+                (unsigned)(xmem_diag[0x0005] & 0xFFFFFF));
     }
 
     // PIO FIFO state
@@ -1840,21 +2002,38 @@ int XApuDiagnostic(char *buf, int bufsize)
             (unsigned)APU(NV_PAPU_MAXVOICES));
 
     // Dump game voice states — check if VP is processing them
+    // Invalidate CPU cache first so we read fresh VP-written values from RAM
+    __asm__ volatile("wbinvd" ::: "memory");
     {
         volatile uint32_t *va = (volatile uint32_t *)voice_array_virt;
         for (int vi = 0; vi < 8; vi++) {
             volatile uint32_t *vv = va + (vi * VP_VOICE_SIZE / 4);
             uint32_t par = vv[VOICE_PAR_STATE / 4];
             uint32_t cbo = vv[VOICE_PAR_OFFSET / 4];
+            uint32_t ebo = vv[VOICE_PAR_NEXT / 4];
             uint32_t fmt = vv[VOICE_CFG_FMT / 4];
             uint32_t pitchlink = vv[VOICE_TAR_PITCH_LINK / 4];
-            uint32_t vbin = vv[VOICE_CFG_VBIN / 4];
+            uint32_t psl = vv[VOICE_CUR_PSL_START / 4];
             if (par != 0 || voice_playing[vi]) {
-                DPRINTF("V%d: PAR=%08X CBO=%08X FMT=%08X PL=%08X VBIN=%08X play=%d\n",
-                        vi, (unsigned)par, (unsigned)cbo, (unsigned)fmt,
-                        (unsigned)pitchlink, (unsigned)vbin, voice_playing[vi]);
+                DPRINTF("V%d: PAR=%08X CBO=%08X EBO=%08X PSL=%08X PL=%08X FMT=%08X play=%d\n",
+                        vi, (unsigned)par, (unsigned)cbo, (unsigned)ebo,
+                        (unsigned)psl, (unsigned)pitchlink, (unsigned)fmt,
+                        voice_playing[vi]);
             }
         }
+    }
+
+    // Full 128-byte dump of voice 0 and voice 1 (all 32 dwords)
+    // This reveals hidden fields the VP/SE might set during processing
+    for (int vdump = 0; vdump < 2; vdump++) {
+        volatile uint32_t *vd = (volatile uint32_t *)
+            ((uint8_t *)voice_array_virt + vdump * VP_VOICE_SIZE);
+        DPRINTF("VDUMP%d:", vdump);
+        for (int d = 0; d < 32; d++) {
+            if ((d % 8) == 0 && d > 0) DPRINTF("\n  +%02X:", d * 4);
+            DPRINTF(" %08X", (unsigned)vd[d]);
+        }
+        DPRINTF("\n");
     }
 
     // FE decoded method/param — last PIO command the FE actually processed
@@ -1918,7 +2097,7 @@ int XApuDiagnostic(char *buf, int bufsize)
             uint32_t first_nz = 0;
             int nz_count = 0;
             for (int s = 0; s < 32; s++) {
-                uint32_t v = scratch[rb_off[ch] / 4 + s] & 0xFFFFFF;
+                uint32_t v = scratch[rb_off[ch] + s] & 0xFFFFFF;  // 16KB pages: index = DSP addr
                 if (v != 0) { nz_count++; if (!first_nz) first_nz = v; }
                 sum += (v > 0x800000) ? (0x1000000 - v) : v;  // abs value
             }
@@ -1930,7 +2109,7 @@ int XApuDiagnostic(char *buf, int bufsize)
         // Also check linear scratch at 0xB000 (640 samples)
         int nz_b = 0;
         for (int s = 0; s < 32; s++) {
-            if (scratch[0xB000 / 4 + s] & 0xFFFFFF) nz_b++;
+            if (scratch[0xB000 + s] & 0xFFFFFF) nz_b++;  // 16KB pages: index = DSP addr
         }
         DPRINTF("GP_SCRATCH_LIN: 0xB000 nz=%d/32\n", nz_b);
     }
@@ -1958,7 +2137,7 @@ int XApuDiagnostic(char *buf, int bufsize)
         // Also dump our GP scratch SGE for comparison
         DPRINTF("GP_SGE: addr=%08X pages:", (unsigned)gp_scratch_pages_phys);
         for (int i = 0; i < GP_SCRATCH_PAGES; i++) {
-            uint32_t pg = gp_scratch_pages_phys + (i * PAGE_SIZE);
+            uint32_t pg = gp_scratch_pages_phys + (i * GP_PAGE_BYTES);
             if (i < 3 || i >= 7)  // Show pages 0-2 and 7+
                 DPRINTF(" [%d]=%08X", i, (unsigned)pg);
             else if (i == 3)
@@ -1966,6 +2145,35 @@ int XApuDiagnostic(char *buf, int bufsize)
         }
         DPRINTF("\n");
     }
+
+    // VP SGE table dump — verify voice sample data mappings
+    if (sge_table_virt) {
+        volatile uint32_t *vp_sge = (volatile uint32_t *)sge_table_virt;
+        DPRINTF("VP_SGE:");
+        for (int i = 0; i < 10; i++) {
+            uint32_t page_addr = vp_sge[i * 2];
+            uint32_t ctrl = vp_sge[i * 2 + 1];
+            if (page_addr != 0 || ctrl != 0)
+                DPRINTF(" [%d]=%08X/%08X", i, (unsigned)page_addr, (unsigned)ctrl);
+        }
+        DPRINTF("\n");
+    }
+
+    // Chain direction verification — dump forward links
+    DPRINTF("CHAIN: last=%d", tvl2d_last_voice);
+    if (voice_array_virt) {
+        volatile uint32_t *va = (volatile uint32_t *)voice_array_virt;
+        // Walk from voice 0 to verify forward links
+        int cur = 0;
+        for (int steps = 0; steps < 10; steps++) {
+            volatile uint32_t *vc = va + (cur * VP_VOICE_SIZE / 4);
+            uint16_t link = (uint16_t)(vc[VOICE_TAR_PITCH_LINK / 4] & 0xFFFF);
+            DPRINTF(" %d->%04X", cur, (unsigned)link);
+            if (link >= MAX_VOICES) break;
+            cur = link;
+        }
+    }
+    DPRINTF("\n");
 
     #undef DPRINTF
     return n;
