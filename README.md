@@ -5,31 +5,6 @@ This is a fork of nxdk with modifications for the **jfduke3d Xbox port**. Key ch
 ### S/PDIF Audio Output Patch
 - Enables digital audio output via S/PDIF on the original Xbox.
 
-### APU Hardware Audio Driver (`lib/hal/apu.c`, `lib/hal/apu.h`)
-A from-scratch Xbox APU (Audio Processing Unit) hardware driver for the MCPX chip, bypassing SDL/AC97 software mixing to use the hardware audio pipeline directly. This is research-grade code developed through extensive reverse-engineering on real Xbox hardware.
-
-**Architecture:** The Xbox MCPX APU contains three subsystems:
-- **VP (Voice Processor):** 256 hardware voices with per-voice pitch, volume, envelope, and filters. Processes PCM samples from RAM via DMA.
-- **GP (Global Processor):** Programmable DSP (Motorola 56301-like) for effects (reverb, EQ, HRTF). Reads from VP's MIXBUF output.
-- **EP (Encode Processor):** Programmable DSP for Dolby Digital 5.1 encoding. Outputs to AC97 DAC.
-
-**What works:**
-- VP voice processing confirmed (PAR_STATE advances through envelope stages, CBO increments through PCM buffer)
-- GP DSP code execution confirmed (preamble marker written to XMEM)
-- Two-phase GPRST initialization (DMA bootstrap then DSP release)
-- Proper 16KB-aligned SGE table allocation (hardware masks bits [13:0])
-- EP/GP DSP release after SE start (so SE catches initial idle edge)
-
-**What's in progress:**
-- GP DSP START_FRAME interrupt delivery — the SE (Setup Engine) never sends START_FRAME to the GP despite correct SECTL/SECONFIG/GPRST configuration. This prevents the GP from processing MIXBUF data into audio output. Active investigation ongoing.
-
-**Key hardware findings documented in the driver:**
-- PMEM MMIO access during GPRST=0 crashes the Xbox
-- CPU cache coherency requires `wbinvd` after writing to DMA-visible memory
-- PIO commands are not processed by the FE microcontroller (works in xemu only)
-- SECONFIG bit 5 is auto-enabled by hardware when GP DSP properly signals idle
-- Hardware zeros XMEM on DSP core reset (GPRST 1->3 transition)
-
 ### Hardware Audio via RXDK DirectSound
 This fork is used by jfduke3d-xbox which implements hardware audio through the Xbox APU's full VP→GP→EP→AC97 pipeline, including 5.1 surround sound via Dolby Digital AC3 encoding over optical S/PDIF.
 
