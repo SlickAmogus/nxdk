@@ -30,36 +30,59 @@ A from-scratch Xbox APU (Audio Processing Unit) hardware driver for the MCPX chi
 - SECONFIG bit 5 is auto-enabled by hardware when GP DSP properly signals idle
 - Hardware zeros XMEM on DSP core reset (GPRST 1->3 transition)
 
-### Hardware Rendering via GL Shim + pbkit
-This fork is used by jfduke3d-xbox which implements hardware-accelerated 3D rendering on the NV2A GPU through a custom OpenGL 1.x/2.0 shim layer built on top of nxdk's **pbkit** (push-buffer kit).
+### Hardware Audio via RXDK DirectSound
+This fork is used by jfduke3d-xbox which implements hardware audio through the Xbox APU's full VP→GP→EP→AC97 pipeline, including 5.1 surround sound via Dolby Digital AC3 encoding over optical S/PDIF.
 
 **How it works:**
-1. The BUILD engine's POLYMOST renderer issues standard OpenGL calls (`glDrawElements`, `glBindTexture`, etc.)
-2. `glbuild_xbox.c` (in jfbuild/src/) translates these into NV2A GPU register writes via pbkit push buffers
-3. pbkit submits commands to the NV2A's PFIFO channel for GPU execution
-4. Vertex programs (VP20) handle MVP transforms; register combiners handle texture sampling
+1. MultiVoc (the audio mixer) generates PCM into ring buffers
+2. `driver_dsound_xbox.c` creates DirectSound looping buffers and pumps PCM into them
+3. RXDK's DirectSound library programs the APU hardware:
+   - **VP** (Voice Processor) plays the DirectSound buffers via hardware DMA
+   - **GP** (Global Processor) handles effects and mixing via DSP code
+   - **EP** (Encode Processor) performs Dolby AC3 encoding for optical output
+4. `DirectSoundDoWork()` is called each frame to drive the hardware pipeline
 
-**To enable hardware rendering in your nxdk project:**
-1. Link against pbkit (`-lpbkit` or include `$(NXDK_DIR)/lib/pbkit/` in your Makefile)
-2. Initialize with `pb_init()` at startup
-3. Each frame: `pb_reset()` → `pb_target_back_buffer()` → draw → `pb_finished()`
-4. Use `pb_push()` / `pb_push1()` to write GPU registers (NV097 class methods)
-5. For textures: allocate with `MmAllocateContiguousMemoryEx()` (physically contiguous for DMA), set via NV097_SET_TEXTURE_* registers
-6. For vertex programs: compile with vp20compiler, upload via NV097_SET_TRANSFORM_PROGRAM
-7. For pixel shading: configure register combiners via NV097_SET_COMBINER_* registers
+**Prerequisites — RXDK dsound.lib:**
+The Xbox DirectSound implementation requires pre-compiled object files from Microsoft's Xbox SDK (RXDK/XDK). These are **not included** in this repository due to licensing. You must provide them yourself:
 
-**Key build flags** (set in your Makefile):
+1. Obtain `dsound.lib` from a legitimate Microsoft Xbox Development Kit (XDK)
+2. Extract the individual .obj files from the .lib archive:
+   ```
+   lib /list dsound.lib              # list contents
+   lib /extract:dsapi.obj dsound.lib # extract each .obj
+   ```
+   Or use a tool like 7-Zip or `ar` to extract all objects.
+3. Strip debug sections (optional, reduces size — nxdk's linker may choke on MSVC debug info):
+   ```
+   llvm-objcopy --strip-debug *.obj
+   ```
+4. Place the extracted .obj files in `xbox_compat/dsound_objs/` in the jfduke3d-xbox tree
+5. Place the RXDK headers (`dsound.h`, `dsfxparm.h`, `pshpack1.h`, `poppack.h`) in `xbox_compat/rxdk_include/`
+
+**Required .obj files** (22 objects from dsound.lib):
 ```
--DUSE_POLYMOST=1    # Enable polymost 3D renderer
--DUSE_OPENGL=2      # OpenGL 2.0 mode (routed through GL shim)
--DRENDERTYPESDL=1   # SDL display backend (handles input + frame management)
+ac97.obj  ac97xmo.obj  cipher.obj  dsapi.obj  dscommon.obj
+dsmath.obj  dsoundi.obj  dspdma.obj  dsperf.obj  epdsp.obj
+globals.obj  gpdsp.obj  heap.obj  hrtf.obj  i3dl2.obj
+mcpapu.obj  mcpbuf.obj  mcpstrm.obj  mcpvoice.obj  mcpxcore.obj
+mixbin.obj  xmotable.obj
 ```
 
-**NV2A GPU notes:**
-- The NV2A is similar to a GeForce 3 Ti — supports vertex programs v1.1 and register combiners (no fragment programs/shaders)
-- Texture formats: ARGB8, DXT1, DXT3, DXT5, swizzled or linear
-- Push buffer size is limited (~512KB default in pbkit) — call `pb_reset()` periodically for long draw sequences
-- VBO-style streaming: write vertices into GPU-visible memory, submit index arrays via NV097_ARRAY_ELEMENT16
+**Key integration points:**
+- `DirectSoundCreate()` initializes the APU and loads GP/EP DSP microcode
+- `DirectSoundOverrideSpeakerConfig(DSSPEAKER_ENABLE_AC3 | DSSPEAKER_SURROUND)` enables 5.1 AC3 output
+- Surround buffers use `DSMIXBIN_*` routing (FRONT_LEFT, FRONT_RIGHT, FRONT_CENTER, LOW_FREQUENCY, BACK_LEFT, BACK_RIGHT)
+- `g_DirectSoundCriticalSection` must be initialized before `DirectSoundCreate` when linking .obj files directly (no DLL init runs)
+- APU registers at `0xFE800000` should be reset before DirectSound init to clear stale kernel state
+
+**Build flags** (in your Makefile):
+```makefile
+DSOUND_CFLAGS = -I$(CURDIR)/xbox_compat/rxdk_include
+DSOUND_OBJS = $(wildcard $(CURDIR)/xbox_compat/dsound_objs/*.obj)
+# Apply RXDK headers only to the dsound driver file:
+driver_dsound_xbox.obj: CFLAGS += $(DSOUND_CFLAGS)
+# Link all dsound .obj files into the final executable
+```
 
 ---
 
