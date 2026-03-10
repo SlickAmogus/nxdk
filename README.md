@@ -30,6 +30,37 @@ A from-scratch Xbox APU (Audio Processing Unit) hardware driver for the MCPX chi
 - SECONFIG bit 5 is auto-enabled by hardware when GP DSP properly signals idle
 - Hardware zeros XMEM on DSP core reset (GPRST 1->3 transition)
 
+### Hardware Rendering via GL Shim + pbkit
+This fork is used by jfduke3d-xbox which implements hardware-accelerated 3D rendering on the NV2A GPU through a custom OpenGL 1.x/2.0 shim layer built on top of nxdk's **pbkit** (push-buffer kit).
+
+**How it works:**
+1. The BUILD engine's POLYMOST renderer issues standard OpenGL calls (`glDrawElements`, `glBindTexture`, etc.)
+2. `glbuild_xbox.c` (in jfbuild/src/) translates these into NV2A GPU register writes via pbkit push buffers
+3. pbkit submits commands to the NV2A's PFIFO channel for GPU execution
+4. Vertex programs (VP20) handle MVP transforms; register combiners handle texture sampling
+
+**To enable hardware rendering in your nxdk project:**
+1. Link against pbkit (`-lpbkit` or include `$(NXDK_DIR)/lib/pbkit/` in your Makefile)
+2. Initialize with `pb_init()` at startup
+3. Each frame: `pb_reset()` → `pb_target_back_buffer()` → draw → `pb_finished()`
+4. Use `pb_push()` / `pb_push1()` to write GPU registers (NV097 class methods)
+5. For textures: allocate with `MmAllocateContiguousMemoryEx()` (physically contiguous for DMA), set via NV097_SET_TEXTURE_* registers
+6. For vertex programs: compile with vp20compiler, upload via NV097_SET_TRANSFORM_PROGRAM
+7. For pixel shading: configure register combiners via NV097_SET_COMBINER_* registers
+
+**Key build flags** (set in your Makefile):
+```
+-DUSE_POLYMOST=1    # Enable polymost 3D renderer
+-DUSE_OPENGL=2      # OpenGL 2.0 mode (routed through GL shim)
+-DRENDERTYPESDL=1   # SDL display backend (handles input + frame management)
+```
+
+**NV2A GPU notes:**
+- The NV2A is similar to a GeForce 3 Ti — supports vertex programs v1.1 and register combiners (no fragment programs/shaders)
+- Texture formats: ARGB8, DXT1, DXT3, DXT5, swizzled or linear
+- Push buffer size is limited (~512KB default in pbkit) — call `pb_reset()` periodically for long draw sequences
+- VBO-style streaming: write vertices into GPU-visible memory, submit index arrays via NV097_ARRAY_ELEMENT16
+
 ---
 
 nxdk - *the new open source xdk*

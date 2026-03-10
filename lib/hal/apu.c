@@ -640,42 +640,84 @@ static int gp_init(void)
         }
     }
 
-    // 7. Write DS GP program + trampoline to scratch pages.
+    // 7. Write GP program to scratch pages.
     // GPRST=3 triggers DMA from CURRENT GPSADDR (ours), which overwrites any
     // PMEM MMIO writes. So scratch pages MUST contain the real program.
     // PMEM MMIO writes (below) handle the brief window before DMA completes.
-    // The DSP halts on BSET idle (~5ms until SE wakes it), giving DMA plenty
-    // of time to finish loading the full program from scratch pages.
     // Zero all scratch pages (256KB) so DMA ringbuffers start clean
     memset((void *)gp_scratch_pages_virt, 0, GP_PAGE_BYTES * GP_SCRATCH_PAGES);
     volatile uint32_t *p0 = (volatile uint32_t *)gp_scratch_pages_virt;
 
-    // BUILD 8: Write FULL DS GP program to scratch PMEM region (offset 0x0000)
-    for (int i = 0; i < (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])); i++) {
-        p0[i] = ds_gp_pmem[i];
+    // BUILD 12: Simple passthrough GP program — frame-aware idle + MIXBUF probes.
+    // Bypasses DS GP program entirely (no FIFO DMA, no complex subroutines).
+    // Combined with submix routing change (vbin0→bin6, vbin1→bin8), VP writes
+    // directly to the MIXBUF bins EP reads from. GP just signals idle so SE
+    // advances the pipeline.
+    //
+    // XMEM probe layout:
+    //   [4] = MIXBUF bin 6 sample 0 (EP ch0 = FL, should have audio)
+    //   [5] = MIXBUF bin 8 sample 0 (EP ch1 = FR, should have audio)
+    //   [6] = MIXBUF bin 0 sample 0 (control: should be 0 with new routing)
+    //   [7] = MIXBUF bin 1 sample 0 (control: should be 0 with new routing)
+    //   [8] = heartbeat (copy of [9], CPU pre-sets [9]=0xB6B6)
+    static const uint32_t gp_b12[] = {
+        // Init: clear interrupt flags
+        /* $000 */ 0x08F485,  // MOVEP #$FFF, X:<<$05
+        /* $001 */ 0x000FFF,
+        /* $002 */ 0x000000,  // NOP (settle)
+        // MAIN LOOP
+        /* $003 */ 0x08F484,  // MOVEP #1, X:<<$04 (signal idle)
+        /* $004 */ 0x000001,
+        /* $005 */ 0x0A8581,  // JCLR #1, X:<<$05, $003 (wait START_FRAME)
+        /* $006 */ 0x000003,
+        /* $007 */ 0x08F485,  // MOVEP #2, X:<<$05 (ack START_FRAME)
+        /* $008 */ 0x000002,
+        // Probe MIXBUF bin 6 sample 0 (X:$14C0) → XMEM[4] (EP FL input)
+        /* $009 */ 0x60F400,  // MOVE #$14C0, R0
+        /* $00A */ 0x0014C0,
+        /* $00B */ 0x56E000,  // MOVE X:(R0), A
+        /* $00C */ 0x60F400,  // MOVE #4, R0
+        /* $00D */ 0x000004,
+        /* $00E */ 0x566000,  // MOVE A, X:(R0)
+        // Probe MIXBUF bin 8 sample 0 (X:$1500) → XMEM[5] (EP FR input)
+        /* $00F */ 0x60F400,  // MOVE #$1500, R0
+        /* $010 */ 0x001500,
+        /* $011 */ 0x56E000,  // MOVE X:(R0), A
+        /* $012 */ 0x60F400,  // MOVE #5, R0
+        /* $013 */ 0x000005,
+        /* $014 */ 0x566000,  // MOVE A, X:(R0)
+        // Probe MIXBUF bin 0 sample 0 (X:$1400) → XMEM[6] (control)
+        /* $015 */ 0x60F400,  // MOVE #$1400, R0
+        /* $016 */ 0x001400,
+        /* $017 */ 0x56E000,  // MOVE X:(R0), A
+        /* $018 */ 0x60F400,  // MOVE #6, R0
+        /* $019 */ 0x000006,
+        /* $01A */ 0x566000,  // MOVE A, X:(R0)
+        // Probe MIXBUF bin 1 sample 0 (X:$1420) → XMEM[7] (control)
+        /* $01B */ 0x60F400,  // MOVE #$1420, R0
+        /* $01C */ 0x001420,
+        /* $01D */ 0x56E000,  // MOVE X:(R0), A
+        /* $01E */ 0x60F400,  // MOVE #7, R0
+        /* $01F */ 0x000007,
+        /* $020 */ 0x566000,  // MOVE A, X:(R0)
+        // Heartbeat: XMEM[9] → XMEM[8]
+        /* $021 */ 0x60F400,  // MOVE #9, R0
+        /* $022 */ 0x000009,
+        /* $023 */ 0x56E000,  // MOVE X:(R0), A
+        /* $024 */ 0x60F400,  // MOVE #8, R0
+        /* $025 */ 0x000008,
+        /* $026 */ 0x566000,  // MOVE A, X:(R0)
+        // Loop back
+        /* $027 */ 0x0AF080,  // JMP $003
+        /* $028 */ 0x000003,
+    };
+
+    for (int i = 0; i < (int)(sizeof(gp_b12) / sizeof(gp_b12[0])); i++) {
+        p0[i] = gp_b12[i];
     }
-    // NOP out XMEM/YMEM zeroing calls in init ($15B/$15D) — we pre-load config
-    p0[0x15B] = 0x000000;  // NOP (was JSR $165 = zero XMEM)
-    p0[0x15C] = 0x000000;  // NOP (was target $165)
-    p0[0x15D] = 0x000000;  // NOP (was JSR $169 = zero YMEM)
-    p0[0x15E] = 0x000000;  // NOP (was target $169)
 
-    // BUILD 11: MIXBUF probe trampoline at $170 (unused space in DS GP program).
-    // After each START_FRAME, reads MIXBUF bin 1 ($1420) and stores to XMEM[$0005].
-    // This verifies VP→MIXBUF data flow (CPU can read XMEM[$0005] via MMIO).
-    p0[0x170] = 0x44F000;  // MOVE X:abs, X0 (read from absolute address)
-    p0[0x171] = 0x001420;  // source = X:$1420 (MIXBUF bin 1, sample 0)
-    p0[0x172] = 0x447000;  // MOVE X0, X:abs (write to absolute address)
-    p0[0x173] = 0x000005;  // dest = X:$0005 (XMEM diagnostic slot)
-    p0[0x174] = ds_gp_pmem[0x02D];  // relocated original instruction at $02D
-    p0[0x175] = ds_gp_pmem[0x02E];  // relocated original extension at $02E
-    p0[0x176] = 0x00000C;  // RTS
-    // Redirect $02D→$02E to call our trampoline instead
-    p0[0x02D] = 0x0BF080;  // JSR abs
-    p0[0x02E] = 0x000170;  // target = $170
-
-    xbox_log("APU: GP scratch = BUILD11 (%d words DS GP, 16KB pages, MIXBUF probe)\n",
-             (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])));
+    xbox_log("APU: GP scratch = BUILD12 (%d words passthrough, 16KB pages, submix→EP direct)\n",
+             (int)(sizeof(gp_b12) / sizeof(gp_b12[0])));
 
     // 8. Flush CPU cache so DMA sees all our writes
     __asm__ volatile("sfence" ::: "memory");  // Flush write-combine buffers first
@@ -692,7 +734,7 @@ static int gp_init(void)
     APU(NV_PAPU_GPFADDR) = gp_fifo_phys;      // BUILD 10: use OUR FIFO SGE!
     APU(NV_PAPU_GPSMAXSGE) = GP_SCRATCH_PAGES - 1;   // 15 (16 scratch pages)
     APU(NV_PAPU_GPFMAXSGE) = GP_SCRATCH_PAGES - 1;   // 15 (16 FIFO pages)
-    xbox_log("APU: GP GPSADDR %08X->%08X GPFADDR %08X->%08X GPFMAX=%X->%X MAXSGE=%X BUILD11\n",
+    xbox_log("APU: GP GPSADDR %08X->%08X GPFADDR %08X->%08X GPFMAX=%X->%X MAXSGE=%X BUILD12\n",
              (unsigned)old_gps, (unsigned)APU(NV_PAPU_GPSADDR),
              (unsigned)old_gpf, (unsigned)APU(NV_PAPU_GPFADDR),
              (unsigned)old_gpfmax, (unsigned)APU(NV_PAPU_GPFMAXSGE),
@@ -708,54 +750,41 @@ static int gp_init(void)
     // Wait for DMA bootstrap to complete
     for (volatile int d = 0; d < 5000000; d++) {}
 
-    // After GPRST=1 DMA completes, write the FULL DS program to PMEM via MMIO.
-    // CRITICAL: GPRST=3 triggers a NEW DMA from scratch pages, but DSP starts
-    // executing IMMEDIATELY, racing ahead of DMA. DMA loads sequentially from $000
-    // upward. If the DSP calls JSR $DB (at word $007), DMA may not have reached
-    // $0DB yet — the DSP would jump to stale/garbage PMEM content and hang.
-    // Solution: write the ENTIRE program via MMIO at GPRST=1, so ALL addresses
-    // are valid before GPRST=3. DMA then overwrites with identical content.
+    // After GPRST=1 DMA completes, write program to PMEM via MMIO.
+    // GPRST=3 triggers a NEW DMA from scratch pages, but DSP starts executing
+    // IMMEDIATELY. MMIO writes ensure all addresses valid before GPRST=3.
+    // DMA then overwrites with identical content from scratch pages.
     volatile uint32_t *pmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPPMEM);
 
-    // BUILD 8: Write FULL DS GP program to PMEM via MMIO (fixes DMA race)
-    for (int i = 0; i < (int)(sizeof(ds_gp_pmem) / sizeof(ds_gp_pmem[0])); i++) {
-        pmem[i] = ds_gp_pmem[i];
+    // BUILD 12: Write passthrough program to PMEM via MMIO (must match scratch)
+    for (int i = 0; i < (int)(sizeof(gp_b12) / sizeof(gp_b12[0])); i++) {
+        pmem[i] = gp_b12[i];
     }
-    // NOP out XMEM/YMEM zeroing in PMEM MMIO too (must match scratch)
-    pmem[0x15B] = 0x000000;
-    pmem[0x15C] = 0x000000;
-    pmem[0x15D] = 0x000000;
-    pmem[0x15E] = 0x000000;
-    // BUILD 11: MIXBUF probe in PMEM MMIO too (must match scratch patches)
-    pmem[0x170] = 0x44F000;  pmem[0x171] = 0x001420;
-    pmem[0x172] = 0x447000;  pmem[0x173] = 0x000005;
-    pmem[0x174] = ds_gp_pmem[0x02D];  pmem[0x175] = ds_gp_pmem[0x02E];
-    pmem[0x176] = 0x00000C;
-    pmem[0x02D] = 0x0BF080;  pmem[0x02E] = 0x000170;
 
     // Verify PMEM MMIO readback
     {
         uint32_t r0 = pmem[0] & 0xFFFFFF;
         uint32_t r1 = pmem[1] & 0xFFFFFF;
-        uint32_t r2d = pmem[0x2D] & 0xFFFFFF;  // Should be JSR $170 (probe)
-        uint32_t r170 = pmem[0x170] & 0xFFFFFF; // Should be MOVE X:abs opcode
-        uint32_t r15b = pmem[0x15B] & 0xFFFFFF; // Should be NOP (patched)
-        xbox_log("APU: GP PMEM@1 B11: $000=%06X $001=%06X $02D=%06X(JSR170?) $170=%06X(probe) $15B=%06X(NOP)\n",
-                 (unsigned)r0, (unsigned)r1, (unsigned)r2d, (unsigned)r170, (unsigned)r15b);
+        uint32_t r3 = pmem[3] & 0xFFFFFF;   // Should be 08F484 (idle)
+        uint32_t r5 = pmem[5] & 0xFFFFFF;   // Should be 0A8581 (JCLR)
+        uint32_t r27 = pmem[0x27] & 0xFFFFFF; // Should be 0AF080 (JMP)
+        xbox_log("APU: GP PMEM@1 B12: $000=%06X $001=%06X $003=%06X(idle?) $005=%06X(JCLR?) $027=%06X(JMP?)\n",
+                 (unsigned)r0, (unsigned)r1, (unsigned)r3, (unsigned)r5, (unsigned)r27);
     }
 
-    // BUILD 11: Zero XMEM then write config on top (DEAD markers no longer needed)
+    // BUILD 12: Zero XMEM/YMEM, load DS config (kept for compatibility), add heartbeat
     volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
     volatile uint32_t *gp_ymem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPYMEM);
     for (int i = 0; i < 4096; i++) gp_xmem[i] = 0;  // Zero all XMEM
     for (int i = 0; i < 2048; i++) gp_ymem[i] = 0;  // Zero all YMEM
 
-    // Load DS GP XMEM configuration on top of markers
+    // Load DS GP XMEM config (not used by passthrough, but kept for future)
     for (int i = 0; i < (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])); i++) {
         gp_xmem[ds_gp_xmem[i].addr] = ds_gp_xmem[i].val;
     }
-    xbox_log("APU: GP XMEM config loaded (%d entries, BUILD 11: 16KB pages + probe)\n",
-             (int)(sizeof(ds_gp_xmem) / sizeof(ds_gp_xmem[0])));
+    // Heartbeat: DSP copies XMEM[9]→XMEM[8] each frame. CPU checks [8].
+    gp_xmem[9] = 0x00B6B6;
+    xbox_log("APU: GP XMEM config loaded + heartbeat (BUILD 12 passthrough)\n");
 
     // Phase B deferred: GPRST=3 happens AFTER SE starts (SECTL=0x0F).
     // The DSP's initial BSET idle must occur while SE is running,
@@ -778,27 +807,25 @@ static void gp_release_dsp(void)
     {
         uint32_t secfg = APU(NV_PAPU_SECONFIG);
         volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        xbox_log("APU: post-release SECONFIG=%08X (bit5=%s bit7=%s) BUILD11\n",
+        xbox_log("APU: post-release SECONFIG=%08X (bit5=%s bit7=%s) BUILD12\n",
                  (unsigned)secfg,
                  (secfg & 0x20) ? "GP_IDLE" : "gp_busy",
                  (secfg & 0x80) ? "EP_IDLE" : "ep_busy");
 
-        // BUILD 11: MIXBUF probe check — XMEM[$0005] holds MIXBUF bin 1 sample 0
-        uint32_t mixprobe = gp_xmem[0x0005] & 0xFFFFFF;
-        xbox_log("APU: MIXBUF probe: XMEM[$5]=%06X (%s)\n",
-                 (unsigned)mixprobe, mixprobe ? "VP→MIXBUF OK!" : "zero/no data");
-
-        // Check scratch output ringbuffers (16KB per page: $8000 = page 8)
-        volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
-        int nz_fl = 0;
-        for (int i = 0; i < 32; i++) {
-            if (scratch[0x8000 + i] & 0xFFFFFF) nz_fl++;
+        // BUILD 12: MIXBUF probes — check if VP data reaches EP input bins
+        uint32_t x4 = gp_xmem[4] & 0xFFFFFF;  // bin 6 (EP FL)
+        uint32_t x5 = gp_xmem[5] & 0xFFFFFF;  // bin 8 (EP FR)
+        uint32_t x6 = gp_xmem[6] & 0xFFFFFF;  // bin 0 (control, should be 0)
+        uint32_t x7 = gp_xmem[7] & 0xFFFFFF;  // bin 1 (control, should be 0)
+        uint32_t x8 = gp_xmem[8] & 0xFFFFFF;  // heartbeat
+        xbox_log("APU: MIXBUF probes: [4]=%06X(bin6/FL) [5]=%06X(bin8/FR) [6]=%06X(bin0) [7]=%06X(bin1) HB=%06X\n",
+                 (unsigned)x4, (unsigned)x5, (unsigned)x6, (unsigned)x7, (unsigned)x8);
+        if (x4 || x5) {
+            xbox_log("APU: *** VP→MIXBUF→EP bins have data! Audio pipeline may be working! ***\n");
         }
-        xbox_log("APU: scratch FL($8000) nz=%d/32 [0]=%06X [1]=%06X XMEM[29]=%06X\n",
-                 nz_fl,
-                 (unsigned)(scratch[0x8000] & 0xFFFFFF),
-                 (unsigned)(scratch[0x8001] & 0xFFFFFF),
-                 (unsigned)(gp_xmem[0x29] & 0xFFFFFF));
+        if (x8 == 0x00B6B6) {
+            xbox_log("APU: *** Heartbeat OK — DSP is running and reaching probe code ***\n");
+        }
     }
 }
 
@@ -1093,15 +1120,19 @@ int XApuInit(void)
                  (secfg_after & 0x20) ? "STUCK" : "REJECTED");
     }
 
-    // Initialize submix registers (0x208C-0x20A8) — submix bin → GP bin routing.
-    // 1:1 mapping for bins 0-5 gives proper 5.1 channel separation:
-    //   submix 0→GP0(FL), 1→GP1(FR), 2→GP2(C), 3→GP3(LFE), 4→GP4(RL), 5→GP5(RR)
-    APU(NV_PAPU_SUBMIX0 + 0 * 4) = 0x03020100;  // submix 0-3 → GP bins 0-3
-    APU(NV_PAPU_SUBMIX0 + 1 * 4) = 0x00000504;  // submix 4-5 → GP bins 4-5, rest→0
+    // BUILD 12: Route VP submix bins DIRECTLY to EP input bins.
+    // Register 0x20AC=09070806 tells EP to read from MIXBUF bins:
+    //   EP ch0 ← bin 6 (FL), EP ch1 ← bin 8 (FR),
+    //   EP ch2 ← bin 7 (Center), EP ch3 ← bin 9 (LFE)
+    // Previously we routed to bins 0-5 and expected GP to move data to 6-9.
+    // But the DS GP program hangs on FIFO DMA. So we skip GP processing and
+    // route VP output directly to the bins EP reads.
+    APU(NV_PAPU_SUBMIX0 + 0 * 4) = 0x09070806;  // vbin0→6(FL), vbin1→8(FR), vbin2→7(C), vbin3→9(LFE)
+    APU(NV_PAPU_SUBMIX0 + 1 * 4) = 0x00000000;  // vbin4-7→0 (unused for now)
     for (int i = 2; i < 8; i++) {
-        APU(NV_PAPU_SUBMIX0 + i * 4) = 0x00000000;  // submix 8-31 → GP bin 0
+        APU(NV_PAPU_SUBMIX0 + i * 4) = 0x00000000;
     }
-    xbox_log("APU: submix registers initialized (208C-20A8)\n");
+    xbox_log("APU: submix routing: vbin0→6(FL) vbin1→8(FR) vbin2→7(C) vbin3→9(LFE) BUILD12\n");
 
     // BUILD 10: Use DirectSound's FECTL value (0x130F = FEMETHMODE=000 = FREE_RUNNING).
     // Previously we used 0x130F (FEMETHMODE=100 = HALTED, kernel boot value).
@@ -1769,15 +1800,14 @@ void XApuPumpMixbuf(short *output, int num_samples)
     if (pump_log_count < 10) {
         uint32_t seconfig = APU(NV_PAPU_SECONFIG);
         volatile uint32_t *gp_xmem = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        // BUILD 11: MIXBUF probe + scratch ringbuffer check
-        uint32_t mixprobe = gp_xmem[0x0005] & 0xFFFFFF;
-        volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
-        uint32_t fl0 = scratch ? (scratch[0x8000] & 0xFFFFFF) : 0;
-        uint32_t fr0 = scratch ? (scratch[0x9000] & 0xFFFFFF) : 0;
-        xbox_log("APU: PUMP#%d SECFG=%08X(b5=%s) MIX5=%06X FL=%06X FR=%06X\n",
+        // BUILD 12: MIXBUF probes — bin 6 (EP FL) and bin 8 (EP FR)
+        uint32_t x4 = gp_xmem[4] & 0xFFFFFF;  // bin 6 = EP FL
+        uint32_t x5 = gp_xmem[5] & 0xFFFFFF;  // bin 8 = EP FR
+        uint32_t x8 = gp_xmem[8] & 0xFFFFFF;  // heartbeat
+        xbox_log("APU: PUMP#%d SECFG=%08X(b5=%s) bin6=%06X bin8=%06X HB=%06X\n",
                  pump_log_count, (unsigned)seconfig,
                  (seconfig & 0x20) ? "Y" : "N",
-                 (unsigned)mixprobe, (unsigned)fl0, (unsigned)fr0);
+                 (unsigned)x4, (unsigned)x5, (unsigned)x8);
         pump_log_count++;
     }
 }
@@ -1846,12 +1876,12 @@ int XApuDiagnostic(char *buf, int bufsize)
         }
         DPRINTF("\n");
         // Show a few specific XMEM values for debugging
-        DPRINTF("XMD: [5]=%06X(MIXprobe) [6]=%06X [28]=%06X [29]=%06X [2A]=%06X\n",
-                (unsigned)(gp_xmem[0x05] & 0xFFFFFF),
-                (unsigned)(gp_xmem[0x06] & 0xFFFFFF),
-                (unsigned)(gp_xmem[0x28] & 0xFFFFFF),
-                (unsigned)(gp_xmem[0x29] & 0xFFFFFF),
-                (unsigned)(gp_xmem[0x2A] & 0xFFFFFF));
+        DPRINTF("XMD: [4]=%06X(bin6/FL) [5]=%06X(bin8/FR) [6]=%06X(bin0) [7]=%06X(bin1) [8]=%06X(HB)\n",
+                (unsigned)(gp_xmem[4] & 0xFFFFFF),
+                (unsigned)(gp_xmem[5] & 0xFFFFFF),
+                (unsigned)(gp_xmem[6] & 0xFFFFFF),
+                (unsigned)(gp_xmem[7] & 0xFFFFFF),
+                (unsigned)(gp_xmem[8] & 0xFFFFFF));
         // Check scratch pages for output ringbuffer data (16KB pages: index = DSP addr)
         volatile uint32_t *scratch = (volatile uint32_t *)gp_scratch_pages_virt;
         if (scratch) {
@@ -1914,14 +1944,14 @@ int XApuDiagnostic(char *buf, int bufsize)
                 (unsigned)(gp_pmem[2] & 0xFFFFFF), (unsigned)(gp_pmem[3] & 0xFFFFFF),
                 (unsigned)(gp_pmem[4] & 0xFFFFFF), (unsigned)(gp_pmem[5] & 0xFFFFFF),
                 (unsigned)(gp_pmem[6] & 0xFFFFFF), (unsigned)(gp_pmem[7] & 0xFFFFFF));
-        // BUILD 11 key addresses: $02D=JSR $170 (probe), $170=MOVE X:abs opcode
+        // BUILD 12: passthrough key addresses
         volatile uint32_t *xmem_diag = (volatile uint32_t *)(APU_GP_BASE + NV_PAPU_GPXMEM);
-        DPRINTF("PMEM B11: $02D=%06X(JSR170?) $02E=%06X $170=%06X(probe) $15B=%06X(NOP) MIX5=%06X\n",
-                (unsigned)(gp_pmem[0x2D] & 0xFFFFFF),
-                (unsigned)(gp_pmem[0x2E] & 0xFFFFFF),
-                (unsigned)(gp_pmem[0x170] & 0xFFFFFF),
-                (unsigned)(gp_pmem[0x15B] & 0xFFFFFF),
-                (unsigned)(xmem_diag[0x0005] & 0xFFFFFF));
+        DPRINTF("PMEM B12: $003=%06X(idle?) $005=%06X(JCLR?) $027=%06X(JMP?) XM[4]=%06X(bin6) [8]=%06X(HB)\n",
+                (unsigned)(gp_pmem[0x03] & 0xFFFFFF),
+                (unsigned)(gp_pmem[0x05] & 0xFFFFFF),
+                (unsigned)(gp_pmem[0x27] & 0xFFFFFF),
+                (unsigned)(xmem_diag[4] & 0xFFFFFF),
+                (unsigned)(xmem_diag[8] & 0xFFFFFF));
     }
 
     // PIO FIFO state
