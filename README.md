@@ -59,6 +59,15 @@ driver_dsound_xbox.obj: CFLAGS += $(DSOUND_CFLAGS)
 # Link all dsound .obj files into the final executable
 ```
 
+
+**Support**
+
+Join The Chill Lounge discord for questions regarding any of my mods\projects (or feel free to message me):
+https://discord.gg/U29t39WR73
+
+If you like what I do:
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F3K8V3B)
+
 ---
 
 nxdk - *the new open source xdk*
@@ -137,3 +146,4 @@ Code Overview
 * `tools/vp20compiler` - Translates vertex program assembly to Xbox microcode.
 * `tools/extract-xiso` - Generates and extracts ISO images compatible with the Xbox (and XQEMU).
 * `samples/` - Sample applications to get started.
+
