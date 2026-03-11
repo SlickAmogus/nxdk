@@ -1,4 +1,4 @@
-About This Fork
+About
 ===============
 This is a fork of nxdk with modifications for the **jfduke3d Xbox port**. Key changes:
 
