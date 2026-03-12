@@ -1,6 +1,6 @@
 About
 ===============
-This is a fork of nxdk with modifications for the **jfduke3d Xbox port**. Key changes:
+This is a fork of nxdk with modifications for the [**VibeDuke3D Xbox port**](https://github.com/SlickAmogus/VibeDuke3D/). Key changes:
 
 ### S/PDIF Audio Output Patch
 - Enables digital audio output via S/PDIF on the original Xbox.
@@ -31,7 +31,7 @@ The Xbox DirectSound implementation requires pre-compiled object files from Micr
    ```
    llvm-objcopy --strip-debug *.obj
    ```
-4. Place the extracted .obj files in `xbox_compat/dsound_objs/` in the jfduke3d-xbox tree
+4. Place the extracted .obj files in `xbox_compat/dsound_objs/` in the root of your project
 5. Place the RXDK headers (`dsound.h`, `dsfxparm.h`, `pshpack1.h`, `poppack.h`) in `xbox_compat/rxdk_include/`
 
 **Required .obj files** (22 objects from dsound.lib):
@@ -66,7 +66,7 @@ To add RXDK DirectSound hardware audio to your own nxdk project, you need the co
 
 #### 1. Required Files
 
-Copy these from [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` into your project for a good starting point:
+Copy these from [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` into your project:
 
 | File | Purpose |
 |------|---------|
