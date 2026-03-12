@@ -1,6 +1,6 @@
 About
 ===============
-This is a fork of nxdk with modifications for the [**VibeDuke3D Xbox port**](https://github.com/SlickAmogus/VibeDuke3D/). Key changes:
+This is a fork of nxdk made using Claude with modifications for the [**VibeDuke3D Xbox port**](https://github.com/SlickAmogus/VibeDuke3D/). Key changes:
 
 ### S/PDIF Audio Output Patch
 - Enables digital audio output via S/PDIF on the original Xbox.
