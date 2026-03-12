@@ -66,20 +66,14 @@ To add RXDK DirectSound hardware audio to your own nxdk project, you need the co
 
 #### 1. Required Files
 
-Copy these from jfduke3d-xbox's `xbox_compat/` into your project:
+Copy these from [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` into your project for a good starting point:
 
 | File | Purpose |
 |------|---------|
-| `dsound_objs/*.obj` | 22 extracted objects from XDK's `dsound.lib` (see Prerequisites above) |
-| `rxdk_include/dsound.h` | RXDK DirectSound header |
-| `rxdk_include/dsfxparm.h` | DSP effect parameter definitions |
-| `rxdk_include/poppack.h` | Structure packing restore |
 | `dsound_bridge.c` | **Calling convention bridge** — RXDK's .obj files use MSVC `__stdcall` but nxdk uses `__cdecl`. This provides `__stdcall` wrappers for Win32 APIs (CreateEvent, WaitForSingleObject, CreateThread, etc.), Xbox API stubs (XMemAlloc/XMemFree for APU DMA memory, XGetAudioFlags), and section loading stubs. |
 | `msvc_compat.c` | **MSVC runtime symbols** — `__ftol2` (float-to-int), `__CIpow` (intrinsic pow), `__CIsinh` (intrinsic sinh), `_fpclass` (IEEE 754 classification), `_except_handler3` (SEH stub). All implemented in pure x87 assembly with no C library dependency. |
 | `xtl.h` | Xbox type definitions and audio flag constants (`XC_AUDIO_FLAGS_*`) |
 | `xbox_defs.h` | Platform defines and type shims |
-
-The `msvcrt_objs/` and `sys/` directories are **not required** — `msvc_compat.c` replaces the need for MSVC runtime .obj files.
 
 #### 2. Strip Debug Sections
 
