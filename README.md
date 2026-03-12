@@ -62,7 +62,7 @@ driver_dsound_xbox.obj: CFLAGS += $(DSOUND_CFLAGS)
 
 ### How to Use Hardware Audio in Your nxdk Project
 
-To add RXDK DirectSound hardware audio to your own nxdk project, you need the compatibility layer files from jfduke3d-xbox's `xbox_compat/` directory and proper build integration.
+To add RXDK DirectSound hardware audio to your own nxdk project, you need the compatibility layer files from [VibeDuke3D's](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` directory and proper build integration.
 
 #### 1. Required Files
 
