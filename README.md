@@ -6,7 +6,7 @@ This is a fork of nxdk with modifications for the [**VibeDuke3D Xbox port**](htt
 - Enables digital audio output via S/PDIF on the original Xbox.
 
 ### Hardware Audio via RXDK DirectSound
-This fork is used by jfduke3d-xbox which implements hardware audio through the Xbox APU's full VP→GP→EP→AC97 pipeline, including 5.1 surround sound via Dolby Digital AC3 encoding over optical S/PDIF.
+This fork is used by [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) which implements hardware audio through the Xbox APU's full VP→GP→EP→AC97 pipeline, including 5.1 surround sound via Dolby Digital AC3 encoding over optical S/PDIF.
 
 **How it works:**
 1. MultiVoc (the audio mixer) generates PCM into ring buffers
@@ -62,11 +62,11 @@ driver_dsound_xbox.obj: CFLAGS += $(DSOUND_CFLAGS)
 
 ### How to Use Hardware Audio in Your nxdk Project
 
-To add RXDK DirectSound hardware audio to your own nxdk project, you need the compatibility layer files from [VibeDuke3D's](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` directory and proper build integration.
+To add RXDK DirectSound hardware audio to your own nxdk project, you need the dsound.lib obj files and and RXDK headers mentioned above, the compatibility layer files from [VibeDuke3D's](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` directory, and proper build integration.
 
 #### 1. Required Files
 
-Copy these from [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` into your project:
+First, copy the .obj files and RXDK headers mentioned above in the prerequisite section to your project, then copy the below files from [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) `xbox_compat/` as well:
 
 | File | Purpose |
 |------|---------|
@@ -183,7 +183,7 @@ With `DSSPEAKER_SURROUND`, the GP automatically generates a stereo downmix for t
 
 #### 6. Reference Implementation
 
-See `jfaudiolib/src/driver_dsound_xbox.c` in jfduke3d-xbox for a complete working implementation with:
+See `jfaudiolib/src/driver_dsound_xbox.c` in [VibeDuke3D](https://github.com/SlickAmogus/VibeDuke3D/tree/main) for a complete working implementation with:
 - 5.1 surround via separate front/center/surround DirectSound buffers
 - Per-channel DSMIXBIN routing
 - Ring buffer pumping with Lock/Unlock
