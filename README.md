@@ -191,10 +191,9 @@ See `jfaudiolib/src/driver_dsound_xbox.c` in [VibeDuke3D](https://github.com/Sli
 
 **Support**
 
-Join The Chill Lounge discord for questions regarding any of my mods\projects (or feel free to message me):\
-https://discord.gg/U29t39WR73
+Message me wherever and I should answer. I am in most of the discords related to these projects as KushAstronaut.
 
-If you like what I do:\
+I make mods and stuff for games. If you like what I do:\
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F3K8V3B)
 
 ---
